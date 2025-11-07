@@ -1,0 +1,51 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Airflow
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/*.pid
+airflow/airflow.db
+airflow/airflow.cfg
+
+# dbt
+dbt_project/target/
+dbt_project/dbt_packages/
+dbt_project/logs/
+
+# Great Expectations
+great_expectations/uncommitted/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Docker
+postgres_data/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+backups/*.sql
+backups/*.sql.gz
+
+# Logs
+*.log

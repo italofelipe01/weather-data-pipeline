@@ -1,0 +1,354 @@
+version: '3.8'
+
+# ==========================================
+# DEFINIÇÃO DE VARIÁVEIS GLOBAIS
+# ==========================================
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.7.3-python3.9
+  environment: &airflow-common-env
+    # Configurações Core do Airflow
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    
+    # Configurações de Schedule
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    
+    # Configurações do Webserver
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__WEBSERVER__RBAC: 'true'
+    
+    # Variáveis de Ambiente do Projeto
+    OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY}
+    POSTGRES_USER: ${POSTGRES_USER:-postgres}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_DB: ${POSTGRES_DB:-weather_db}
+    DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-weather_db}
+    SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    
+    # Python Path
+    PYTHONPATH: /opt/airflow
+    
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/extractors:/opt/airflow/extractors
+    - ${AIRFLOW_PROJ_DIR:-.}/dbt_project:/opt/airflow/dbt_project
+    - ${AIRFLOW_PROJ_DIR:-.}/great_expectations:/opt/airflow/great_expectations
+    - ${AIRFLOW_PROJ_DIR:-.}/requirements.txt:/requirements.txt
+    
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+# ==========================================
+# SERVIÇOS
+# ==========================================
+services:
+  
+  # ==========================================
+  # POSTGRESQL - Database Principal
+  # ==========================================
+  postgres:
+    image: postgres:14-alpine
+    container_name: weather_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-weather_db}
+      POSTGRES_MULTIPLE_DATABASES: "weather_db,airflow"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init_scripts:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - weather_network
+
+  # ==========================================
+  # REDIS - Message Broker para Airflow
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: weather_redis
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    networks:
+      - weather_network
+
+  # ==========================================
+  # AIRFLOW WEBSERVER - Interface Web
+  # ==========================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: weather_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - weather_network
+
+  # ==========================================
+  # AIRFLOW SCHEDULER - Agendador de DAGs
+  # ==========================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: weather_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - weather_network
+
+  # ==========================================
+  # AIRFLOW WORKER - Executor de Tarefas
+  # ==========================================
+  airflow-worker:
+    <<: *airflow-common
+    container_name: weather_airflow_worker
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - weather_network
+
+  # ==========================================
+  # AIRFLOW TRIGGERER - Para tarefas assíncronas
+  # ==========================================
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: weather_airflow_triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - weather_network
+
+  # ==========================================
+  # AIRFLOW INIT - Inicialização única
+  # ==========================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: weather_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Criar diretórios necessários
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        
+        # Instalar dependências Python
+        pip install --no-cache-dir -r /requirements.txt
+        
+        # Inicializar banco de dados do Airflow
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+    networks:
+      - weather_network
+
+  # ==========================================
+  # AIRFLOW CLI - Utilitário para comandos
+  # ==========================================
+  airflow-cli:
+    <<: *airflow-common
+    container_name: weather_airflow_cli
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+    networks:
+      - weather_network
+
+  # ==========================================
+  # APACHE SUPERSET - BI Tool
+  # ==========================================
+  superset:
+    image: apache/superset:3.0.0
+    container_name: weather_superset
+    environment:
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - SUPERSET_LOAD_EXAMPLES=no
+      - DATABASE_DIALECT=postgresql
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_DB=weather_db
+      - DATABASE_USER=${POSTGRES_USER:-postgres}
+      - DATABASE_PASSWORD=${POSTGRES_PASSWORD}
+    ports:
+      - "8088:8088"
+    volumes:
+      - superset_data:/app/superset_home
+      - ./superset/dashboards:/app/dashboards
+    depends_on:
+      - postgres
+    command: >
+      sh -c "
+      superset db upgrade &&
+      superset fab create-admin 
+        --username ${SUPERSET_ADMIN_USERNAME:-admin} 
+        --firstname Admin 
+        --lastname User 
+        --email admin@superset.com 
+        --password ${SUPERSET_ADMIN_PASSWORD:-admin} || true &&
+      superset init &&
+      gunicorn 
+        --bind 0.0.0.0:8088 
+        --workers 4 
+        --timeout 120 
+        --limit-request-line 0 
+        --limit-request-field_size 0 
+        'superset.app:create_app()'
+      "
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - weather_network
+
+  # ==========================================
+  # PGADMIN - Interface de administração PostgreSQL (OPCIONAL)
+  # ==========================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: weather_pgadmin
+    profiles:
+      - debug
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@admin.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    networks:
+      - weather_network
+
+  # ==========================================
+  # JUPYTER NOTEBOOK - Análise exploratória (OPCIONAL)
+  # ==========================================
+  jupyter:
+    image: jupyter/datascience-notebook:latest
+    container_name: weather_jupyter
+    profiles:
+      - debug
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - GRANT_SUDO=yes
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - jupyter_data:/home/jovyan
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+    restart: unless-stopped
+    networks:
+      - weather_network
+
+# ==========================================
+# VOLUMES PERSISTENTES
+# ==========================================
+volumes:
+  postgres_data:
+    driver: local
+  superset_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+  jupyter_data:
+    driver: local
+
+# ==========================================
+# NETWORKS
+# ==========================================
+networks:
+  weather_network:
+    driver: bridge
+    name: weather_network
