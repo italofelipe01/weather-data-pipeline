@@ -1,0 +1,13 @@
+.aws-sam/
+.coverage
+.env
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.py[cod]
+pytest-cache-files-*/
+.tool-*.json
+build/
+dist/
+*.egg-info/

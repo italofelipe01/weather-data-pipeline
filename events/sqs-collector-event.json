@@ -1,0 +1,8 @@
+{
+  "Records": [
+    {
+      "messageId": "example-message",
+      "body": "{\"source\":\"openweather-free-plan\",\"product\":\"current_weather\",\"city\":\"Sao Paulo\",\"state\":\"SP\",\"ibge_code\":\"3550308\",\"latitude\":-23.5505,\"longitude\":-46.6333,\"timezone\":\"America/Sao_Paulo\",\"snapshot_at\":\"2026-06-25T12:00:00Z\",\"units\":\"metric\",\"lang\":\"pt_br\"}"
+    }
+  ]
+}

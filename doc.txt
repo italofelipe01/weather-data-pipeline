@@ -1,0 +1,162 @@
+Voce e um engenheiro de software e dados responsavel por corrigir e implementar o repositorio AWS de clima em:
+
+C:\repositories\weather-data-pipeline
+
+OBJETIVO
+
+Criar uma pipeline serverless AWS para coletar dados atuais e previsoes da OpenWeather para todas as capitais do Brasil, usando apenas os recursos do plano gratuito, formando uma base temporal propria para analises futuras.
+
+O projeto nao deve comprar historico passado nesta etapa. A analise historica sera construida a partir dos snapshots coletados continuamente.
+
+FONTE DE DADOS
+
+Usar somente APIs do plano gratuito:
+
+- Current Weather API.
+- 5 Day / 3 Hour Forecast API.
+
+Nao usar nesta etapa:
+
+- One Call API 4.0.
+- History API.
+- APIs historicas pagas.
+
+LIMITES
+
+O plano gratuito documentado permite:
+
+- 60 chamadas por minuto.
+- 1.000.000 chamadas por mes.
+
+O teto operacional do projeto deve ser 50% do teto mensal:
+
+- 500.000 chamadas por mes.
+
+Cadencia padrao:
+
+- Current Weather API para 27 capitais a cada 3 minutos.
+- 5 Day / 3 Hour Forecast API para 27 capitais a cada 1 hora.
+
+Estimativa mensal de 30 dias:
+
+- Current: 27 * 20 * 24 * 30 = 388.800 chamadas.
+- Forecast: 27 * 24 * 30 = 19.440 chamadas.
+- Total: 408.240 chamadas.
+
+Isso deixa margem para testes, retries e operacao manual.
+
+ARQUITETURA
+
+EventBridge ou operador
+  -> Lambda Planner
+  -> SQS FIFO
+  -> Lambda Collector
+  -> OpenWeather Free APIs
+  -> S3 Raw JSON
+  -> Lambda Curator
+  -> S3 Curated Hourly CSV
+
+Recursos auxiliares:
+
+- SQS Dead Letter Queue.
+- SSM Parameter Store para a chave da OpenWeather.
+- CloudWatch Logs.
+- CloudWatch Metrics.
+- CloudWatch Alarms.
+- IAM com menor privilegio.
+- AWS Budget opcional por e-mail.
+
+CONTROLE DE CUSTO
+
+O projeto deve ser saudavel para operar com US$ 100 de credito durante seis meses.
+
+Padroes obrigatorios:
+
+1. Schedules desabilitados por padrao.
+2. Raw JSON com retencao padrao de 30 dias.
+3. CloudWatch Logs com retencao padrao de 7 dias.
+4. Sem NAT Gateway.
+5. Sem banco relacional.
+6. Sem Glue/Athena nesta etapa inicial.
+7. Budget opcional via parametro BudgetAlertEmail.
+8. Teto operacional OpenWeather de 500.000 chamadas/mes.
+
+LAMBDA PLANNER
+
+A Planner deve:
+
+1. Gerar um job por capital e produto.
+2. Aceitar filtro opcional por UF.
+3. Aceitar produtos current_weather e forecast_5d_3h.
+4. Definir snapshot_at em UTC arredondado para minuto.
+5. Enviar mensagens para SQS FIFO.
+6. Usar MessageGroupId por UF.
+7. Usar MessageDeduplicationId derivado do conteudo do job.
+
+LAMBDA COLLECTOR
+
+A Collector deve:
+
+1. Processar lotes da SQS.
+2. Implementar partial batch response.
+3. Ler appid da OpenWeather no SSM SecureString.
+4. Nunca registrar appid.
+5. Chamar o endpoint correto conforme product.
+6. Validar resposta JSON.
+7. Tratar 429 e 5xx como retry.
+8. Gravar raw JSON no S3.
+9. Usar chave S3 deterministica por produto, capital e snapshot_at.
+10. Usar If-None-Match igual a "*".
+
+LAMBDA CURATOR
+
+A Curator deve:
+
+1. Ler uma hora fechada de raw/current_weather.
+2. Extrair campos climaticos principais.
+3. Agrupar por capital e hora.
+4. Gerar uma tabela CSV com uma linha por capital por hora.
+5. Separar colunas de data, hora, ano, mes e dia.
+6. Gravar em curated/hourly_observations/.
+7. Ser executavel manualmente e por schedule quando habilitado.
+
+S3 RAW
+
+Chave:
+
+raw/source=openweather-free-plan/product=<produto>/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/state=<uf>/city=<cidade>/openweather_<produto>_<uf>_<cidade>_<timestamp>.json
+
+S3 CURATED HORARIO
+
+Chave:
+
+curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<timestamp>.csv
+
+AGREGACAO FUTURA
+
+Quando houver dados suficientes, criar camada curated com:
+
+- media por hora.
+- media diaria.
+- min/max por periodo.
+- acumulado de chuva.
+- comparacao entre capitais.
+- tendencia por semanas, meses e anos.
+
+COMANDOS
+
+Testes:
+
+./scripts/test.ps1
+
+Deploy:
+
+./scripts/deploy.ps1 -StackName weather-data-pipeline-dev -Environment dev -Region sa-east-1 -MonthlyOperationalCallLimit 500000
+
+Cadastrar chave:
+
+./scripts/set-openweather-key.ps1 -ApiKey "<OPENWEATHER_API_KEY>" -Environment dev -Region sa-east-1
+
+Invocar planejamento:
+
+./scripts/invoke-planner.ps1 -StackName weather-data-pipeline-dev -Region sa-east-1
