@@ -14,7 +14,7 @@ from shared.hourly_table import (
     build_raw_hour_prefix,
     extract_current_weather_sample,
     parse_target_hour,
-    records_to_csv,
+    records_to_parquet,
 )
 from shared.structured_logging import log_count_metric, log_event
 
@@ -60,12 +60,12 @@ def curate_hour(target_hour_value: object | None = None) -> dict[str, Any]:
     raw_objects = _iter_raw_objects(s3_client, bucket, raw_prefix)
     samples = [sample for source_object in raw_objects if (sample := extract_current_weather_sample(source_object)) is not None]
     records = aggregate_hourly(samples)
-    csv_body = records_to_csv(records)
+    parquet_body = records_to_parquet(records)
     s3_client.put_object(
         Bucket=bucket,
         Key=curated_key,
-        Body=csv_body.encode("utf-8"),
-        ContentType="text/csv",
+        Body=parquet_body,
+        ContentType="application/vnd.apache.parquet",
         ServerSideEncryption="AES256",
     )
     return {

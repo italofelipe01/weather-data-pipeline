@@ -1,6 +1,7 @@
-import csv
 import io
 from datetime import UTC, datetime
+
+import pyarrow.parquet as pq
 
 from shared.hourly_table import (
     aggregate_hourly,
@@ -8,7 +9,7 @@ from shared.hourly_table import (
     build_raw_hour_prefix,
     extract_current_weather_sample,
     parse_target_hour,
-    records_to_csv,
+    records_to_parquet,
 )
 
 
@@ -36,7 +37,9 @@ def _source_object(temp: float, snapshot_at: str = "2026-06-25T12:10:00Z") -> di
 def test_build_hour_prefixes() -> None:
     target = datetime(2026, 6, 25, 12, tzinfo=UTC)
     assert build_raw_hour_prefix(target) == "raw/source=openweather-free-plan/product=current_weather/year=2026/month=06/day=25/hour=12/"
-    assert build_curated_hourly_key(target) == ("curated/hourly_observations/year=2026/month=06/day=25/hour=12/weather_hourly_observations_20260625T1200Z.csv")
+    assert build_curated_hourly_key(target) == (
+        "curated/hourly_observations/year=2026/month=06/day=25/hour=12/weather_hourly_observations_20260625T1200Z.parquet"
+    )
 
 
 def test_parse_target_hour_rounds_down() -> None:
@@ -65,10 +68,13 @@ def test_aggregate_hourly_records() -> None:
     assert records[0]["rain_1h_sum"] == 1.0
 
 
-def test_records_to_csv_has_tabular_header() -> None:
+def test_records_to_parquet_has_typed_columns() -> None:
     records = aggregate_hourly([extract_current_weather_sample(_source_object(22.0))], processed_at="2026-06-25T13:00:00Z")
-    csv_body = records_to_csv(records)
-    rows = list(csv.DictReader(io.StringIO(csv_body)))
-    assert rows[0]["observation_date"] == "2026-06-25"
+    parquet_body = records_to_parquet(records)
+    table = pq.read_table(io.BytesIO(parquet_body))
+    assert str(table.schema.field("observation_date").type) == "date32[day]"
+    assert str(table.schema.field("temperature_avg").type) == "double"
+    rows = table.to_pylist()
+    assert rows[0]["observation_date"].isoformat() == "2026-06-25"
     assert rows[0]["city"] == "Sao Paulo"
-    assert rows[0]["temperature_avg"] == "22.0"
+    assert rows[0]["temperature_avg"] == 22.0

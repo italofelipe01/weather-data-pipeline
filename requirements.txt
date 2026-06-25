@@ -4,4 +4,5 @@ coverage
 cfn-lint
 pytest
 pytest-cov
+pyarrow
 ruff

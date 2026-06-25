@@ -2,8 +2,8 @@
 
 Depois que a fonte raw estiver validada:
 
-1. Converter `curated/hourly_observations/` de CSV para Parquet.
-2. Criar agregados diarios e mensais a partir da tabela horaria.
+1. Catalogar `curated/hourly_observations/` no Glue Data Catalog.
+2. Criar agregados diarios e mensais a partir da tabela horaria em Parquet.
 3. Criar Glue Data Catalog.
 4. Criar Athena Workgroup e queries analiticas.
 5. Adicionar testes PySpark para schema, particionamento e metricas climaticas.

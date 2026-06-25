@@ -1,37 +1,41 @@
 from __future__ import annotations
 
-import csv
 import io
 import statistics
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-HOURLY_FIELDNAMES = [
-    "observation_date",
-    "observation_hour",
-    "observation_timestamp",
-    "year",
-    "month",
-    "day",
-    "city",
-    "state",
-    "ibge_code",
-    "latitude",
-    "longitude",
-    "temperature_avg",
-    "temperature_min",
-    "temperature_max",
-    "feels_like_avg",
-    "humidity_avg",
-    "pressure_avg",
-    "wind_speed_avg",
-    "clouds_avg",
-    "rain_1h_sum",
-    "sample_count",
-    "source_product",
-    "processed_at",
-]
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+HOURLY_SCHEMA = pa.schema(
+    [
+        pa.field("observation_date", pa.date32()),
+        pa.field("observation_hour", pa.int16()),
+        pa.field("observation_timestamp", pa.timestamp("ms")),
+        pa.field("year", pa.int16()),
+        pa.field("month", pa.int8()),
+        pa.field("day", pa.int8()),
+        pa.field("city", pa.string()),
+        pa.field("state", pa.string()),
+        pa.field("ibge_code", pa.string()),
+        pa.field("latitude", pa.float64()),
+        pa.field("longitude", pa.float64()),
+        pa.field("temperature_avg", pa.float64()),
+        pa.field("temperature_min", pa.float64()),
+        pa.field("temperature_max", pa.float64()),
+        pa.field("feels_like_avg", pa.float64()),
+        pa.field("humidity_avg", pa.float64()),
+        pa.field("pressure_avg", pa.float64()),
+        pa.field("wind_speed_avg", pa.float64()),
+        pa.field("clouds_avg", pa.float64()),
+        pa.field("rain_1h_sum", pa.float64()),
+        pa.field("sample_count", pa.int16()),
+        pa.field("source_product", pa.string()),
+        pa.field("processed_at", pa.timestamp("ms")),
+    ]
+)
 
 
 def parse_target_hour(value: object | None = None) -> datetime:
@@ -49,7 +53,7 @@ def build_raw_hour_prefix(target_hour: datetime) -> str:
 def build_curated_hourly_key(target_hour: datetime) -> str:
     hour = target_hour.astimezone(UTC)
     timestamp = hour.strftime("%Y%m%dT%H00Z")
-    return f"curated/hourly_observations/year={hour:%Y}/month={hour:%m}/day={hour:%d}/hour={hour:%H}/weather_hourly_observations_{timestamp}.csv"
+    return f"curated/hourly_observations/year={hour:%Y}/month={hour:%m}/day={hour:%d}/hour={hour:%H}/weather_hourly_observations_{timestamp}.parquet"
 
 
 def _as_float(value: Any) -> float | None:
@@ -143,10 +147,22 @@ def aggregate_hourly(samples: list[dict[str, Any]], processed_at: str | None = N
     return records
 
 
-def records_to_csv(records: list[dict[str, Any]]) -> str:
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=HOURLY_FIELDNAMES, lineterminator="\n")
-    writer.writeheader()
-    for record in records:
-        writer.writerow({field: "" if record.get(field) is None else record.get(field) for field in HOURLY_FIELDNAMES})
+def _parse_utc_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC).replace(tzinfo=None)
+
+
+def _record_for_parquet(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **record,
+        "observation_date": date.fromisoformat(str(record["observation_date"])),
+        "observation_timestamp": _parse_utc_timestamp(str(record["observation_timestamp"])),
+        "processed_at": _parse_utc_timestamp(str(record["processed_at"])),
+    }
+
+
+def records_to_parquet(records: list[dict[str, Any]]) -> bytes:
+    rows = [_record_for_parquet(record) for record in records]
+    table = pa.Table.from_pylist(rows, schema=HOURLY_SCHEMA)
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer, compression="snappy")
     return buffer.getvalue()

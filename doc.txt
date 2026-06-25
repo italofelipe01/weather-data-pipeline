@@ -54,7 +54,7 @@ EventBridge ou operador
   -> OpenWeather Free APIs
   -> S3 Raw JSON
   -> Lambda Curator
-  -> S3 Curated Hourly CSV
+  -> S3 Curated Hourly Parquet
 
 Recursos auxiliares:
 
@@ -115,7 +115,7 @@ A Curator deve:
 1. Ler uma hora fechada de raw/current_weather.
 2. Extrair campos climaticos principais.
 3. Agrupar por capital e hora.
-4. Gerar uma tabela CSV com uma linha por capital por hora.
+4. Gerar uma tabela Parquet com uma linha por capital por hora.
 5. Separar colunas de data, hora, ano, mes e dia.
 6. Gravar em curated/hourly_observations/.
 7. Ser executavel manualmente e por schedule quando habilitado.
@@ -130,7 +130,7 @@ S3 CURATED HORARIO
 
 Chave:
 
-curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<timestamp>.csv
+curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<timestamp>.parquet
 
 AGREGACAO FUTURA
 

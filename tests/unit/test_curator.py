@@ -59,5 +59,6 @@ def test_curate_hour_reads_raw_and_writes_curated(monkeypatch) -> None:
     monkeypatch.setattr(handler, "_get_s3_client", lambda: fake_s3)
     result = handler.curate_hour("2026-06-25T12:00:00Z")
     assert result["records"] == 1
-    assert fake_s3.put_calls[0]["Key"].endswith("weather_hourly_observations_20260625T1200Z.csv")
-    assert "temperature_avg" in fake_s3.put_calls[0]["Body"].decode("utf-8")
+    assert fake_s3.put_calls[0]["Key"].endswith("weather_hourly_observations_20260625T1200Z.parquet")
+    assert fake_s3.put_calls[0]["ContentType"] == "application/vnd.apache.parquet"
+    assert fake_s3.put_calls[0]["Body"].startswith(b"PAR1")

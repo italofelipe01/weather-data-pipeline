@@ -16,7 +16,7 @@ flowchart LR
   C --> O[OpenWeather Free APIs]
   C --> S[(S3 raw JSON)]
   S --> U[Lambda Curator]
-  U --> T[(S3 curated CSV horario)]
+  U --> T[(S3 curated Parquet horario)]
   C --> L[CloudWatch]
 ```
 
@@ -143,10 +143,10 @@ Depois de coletar dados raw de uma hora, rode a Curator:
   -TargetHour "2026-06-25T12:00:00Z"
 ```
 
-A saida tabular fica em CSV com colunas separadas de data, hora, cidade, UF e metricas climaticas:
+A saida tabular fica em Parquet com schema tipado, compressao Snappy e colunas separadas de data, hora, cidade, UF e metricas climaticas:
 
 ```text
-curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<timestamp>.csv
+curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<timestamp>.parquet
 ```
 
 ## Chave S3 raw

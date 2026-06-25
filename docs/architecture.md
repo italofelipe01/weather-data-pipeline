@@ -11,6 +11,6 @@ Fluxo:
 5. A Collector chama Current Weather API ou 5 Day / 3 Hour Forecast API.
 6. A resposta raw e gravada no S3 com chave particionada por produto, UF, cidade e hora.
 7. Falhas transitorias retornam para retry; apos tres tentativas vao para DLQ.
-8. A Curator consolida a hora fechada de `current_weather` em CSV tabular em `curated/hourly_observations/`.
+8. A Curator consolida a hora fechada de `current_weather` em Parquet tabular em `curated/hourly_observations/`.
 
-A etapa analitica seguinte deve converter a camada horaria para Parquet e derivar agregados diarios e mensais.
+A etapa analitica seguinte deve catalogar a camada horaria no Glue/Athena e derivar agregados diarios e mensais.
