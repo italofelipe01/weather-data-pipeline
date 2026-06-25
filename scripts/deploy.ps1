@@ -14,7 +14,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
-sam build
+sam build --use-container
 sam deploy `
   --stack-name $StackName `
   --region $Region `

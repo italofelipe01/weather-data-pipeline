@@ -6,6 +6,7 @@ stack_name = "weather-data-pipeline-dev"
 [default.build.parameters]
 cached = true
 parallel = true
+use_container = true
 
 [default.deploy.parameters]
 capabilities = "CAPABILITY_IAM"
