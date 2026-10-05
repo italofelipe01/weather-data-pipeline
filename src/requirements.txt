@@ -1,1 +1,3 @@
-pyarrow
+# Lambda code dependencies.
+# boto3 comes with the python3.13 runtime and pyarrow ships in the AnalyticsLayer (layers/analytics),
+# attached only to the Curator, so Planner, Collector and Publisher stay small.
