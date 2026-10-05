@@ -145,7 +145,7 @@ def json_value(value: Any) -> Any:
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, float):
-        return None if math.isnan(value) or math.isinf(value) else round(value, 4)
+        return None if math.isnan(value) or math.isinf(value) else round(value, 2)
     if isinstance(value, dict):
         return {key: json_value(item) for key, item in value.items()}
     if isinstance(value, list | tuple):

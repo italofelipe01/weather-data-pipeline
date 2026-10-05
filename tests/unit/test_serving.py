@@ -27,7 +27,7 @@ def test_keys_are_lowercase_per_state() -> None:
 
 def test_json_value_serializes_dates_and_drops_nan() -> None:
     assert json_value({"a": [date(2026, 6, 25), datetime(2026, 6, 25, 12, tzinfo=UTC), float("nan"), 1.123456]}) == {
-        "a": ["2026-06-25", "2026-06-25T12:00:00Z", None, 1.1235]
+        "a": ["2026-06-25", "2026-06-25T12:00:00Z", None, 1.12]
     }
 
 

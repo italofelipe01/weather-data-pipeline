@@ -11,3 +11,5 @@ pytest-cache-files-*/
 build/
 dist/
 *.egg-info/
+.local-data/
+frontend/data/
