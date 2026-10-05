@@ -1,12 +1,15 @@
--- Consulta futura para Athena, apos catalogar a camada raw ou curated.
--- Inventario de snapshots coletados por produto e capital.
+-- Cobertura da coleta: horas curadas e observacoes distintas por capital e dia (UTC).
 SELECT
-  product,
+  observation_date,
   state,
   city,
-  min(snapshot_at) AS first_snapshot_at,
-  max(snapshot_at) AS last_snapshot_at,
-  count(*) AS snapshots_collected
-FROM weather_source_snapshots
-GROUP BY product, state, city
-ORDER BY product, state, city;
+  count(*) AS hours_curated,
+  sum(sample_count) AS snapshots,
+  sum(observation_count) AS distinct_observations,
+  sum(air_sample_count) AS air_snapshots
+FROM weather_hourly_observations
+WHERE year = 2026
+  AND month = 10
+GROUP BY observation_date, state, city
+HAVING count(*) < 24
+ORDER BY observation_date, state;

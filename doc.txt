@@ -1,25 +1,28 @@
-Voce e um engenheiro de software e dados responsavel por corrigir e implementar o repositorio AWS de clima em:
+Voce e um engenheiro de software e dados responsavel por manter o repositorio AWS de clima em:
 
 C:\repositories\weather-data-pipeline
 
 OBJETIVO
 
-Criar uma pipeline serverless AWS para coletar dados atuais e previsoes da OpenWeather para todas as capitais do Brasil, usando apenas os recursos do plano gratuito, formando uma base temporal propria para analises futuras.
+Manter uma pipeline serverless AWS que coleta dados atuais, previsoes e qualidade do ar da OpenWeather para todas as capitais do Brasil, usando apenas os recursos do plano gratuito, formando uma base temporal propria para analises e um dashboard web que funciona sem intervencao manual.
 
-O projeto nao deve comprar historico passado nesta etapa. A analise historica sera construida a partir dos snapshots coletados continuamente.
+O projeto nao compra historico passado. A analise historica e construida a partir dos snapshots coletados continuamente.
 
 FONTE DE DADOS
 
-Usar somente APIs do plano gratuito:
+Usar somente APIs do plano gratuito, aproveitando todos os campos documentados:
 
 - Current Weather API.
 - 5 Day / 3 Hour Forecast API.
+- Air Pollution API (atual).
+- Air Pollution API (previsao de 4 dias).
 
-Nao usar nesta etapa:
+Nao usar:
 
-- One Call API 4.0.
+- One Call API.
 - History API.
-- APIs historicas pagas.
+- Air Pollution history.
+- APIs pagas.
 
 LIMITES
 
@@ -28,47 +31,55 @@ O plano gratuito documentado permite:
 - 60 chamadas por minuto.
 - 1.000.000 chamadas por mes.
 
-O teto operacional do projeto deve ser 50% do teto mensal:
+O teto operacional do projeto e 50% do teto mensal, aplicado pela Planner:
 
 - 500.000 chamadas por mes.
 
 Cadencia padrao:
 
-- Current Weather API para 27 capitais a cada 3 minutos.
-- 5 Day / 3 Hour Forecast API para 27 capitais a cada 1 hora.
+- Current Weather para 27 capitais a cada 3 minutos (CurrentWeatherIntervalMinutes).
+- Forecast para 27 capitais a cada 1 hora (minuto 05).
+- Air Pollution para 27 capitais a cada 1 hora (minuto 35).
+- Air Pollution forecast para 27 capitais a cada 6 horas (minuto 50).
 
-Estimativa mensal de 30 dias:
+Estimativa para 31 dias:
 
-- Current: 27 * 20 * 24 * 30 = 388.800 chamadas.
-- Forecast: 27 * 24 * 30 = 19.440 chamadas.
-- Total: 408.240 chamadas.
+- Current: 27 * 20 * 24 * 31 = 401.760 chamadas.
+- Forecast: 27 * 24 * 31 = 20.088 chamadas.
+- Air Pollution: 27 * 24 * 31 = 20.088 chamadas.
+- Air Pollution forecast: 27 * 4 * 31 = 3.348 chamadas.
+- Total: 445.284 chamadas (430.920 em 30 dias).
 
-Isso deixa margem para testes, retries e operacao manual.
+No maximo duas agendas compartilham a mesma janela de 60 segundos (54 chamadas) e a Collector roda com concorrencia maxima 2.
 
 ARQUITETURA
 
 EventBridge ou operador
-  -> Lambda Planner
+  -> Lambda Planner (aplica o teto mensal)
   -> SQS FIFO
   -> Lambda Collector
   -> OpenWeather Free APIs
   -> S3 Raw JSON
-  -> Lambda Curator
-  -> S3 Curated Hourly Parquet
+  -> Lambda Curator (hora:20)
+  -> S3 Curated Parquet (horaria, diaria, previsao)
+  -> Glue Data Catalog + Athena
+  -> S3 site data/*.json
+Lambda Publisher (10 min) -> S3 site data/latest.json
+CloudFront -> dashboard estatico
 
 Recursos auxiliares:
 
 - SQS Dead Letter Queue.
 - SSM Parameter Store para a chave da OpenWeather.
-- CloudWatch Logs.
-- CloudWatch Metrics.
-- CloudWatch Alarms.
+- CloudWatch Logs, metricas EMF, alarmes e dashboard de operacao.
+- SNS para alertas por e-mail.
 - IAM com menor privilegio.
 - AWS Budget opcional por e-mail.
+- Layer com pyarrow apenas para a Curator.
 
 CONTROLE DE CUSTO
 
-O projeto deve ser saudavel para operar com US$ 100 de credito durante seis meses.
+O projeto deve ser saudavel para operar com US$ 100 de credito durante seis meses (estimativa atual: US$ 4 a 5 por mes).
 
 Padroes obrigatorios:
 
@@ -77,21 +88,23 @@ Padroes obrigatorios:
 3. CloudWatch Logs com retencao padrao de 7 dias.
 4. Sem NAT Gateway.
 5. Sem banco relacional.
-6. Sem Glue/Athena nesta etapa inicial.
+6. Glue apenas com partition projection (sem crawler) e Athena com limite de 1 GB por consulta.
 7. Budget opcional via parametro BudgetAlertEmail.
-8. Teto operacional OpenWeather de 500.000 chamadas/mes.
+8. Teto operacional OpenWeather de 500.000 chamadas/mes aplicado no codigo.
+9. Metricas e alarmes dentro do Free Tier do CloudWatch.
 
 LAMBDA PLANNER
 
 A Planner deve:
 
 1. Gerar um job por capital e produto.
-2. Aceitar filtro opcional por UF.
-3. Aceitar produtos current_weather e forecast_5d_3h.
+2. Aceitar filtro opcional por UF (UFs invalidas geram erro).
+3. Aceitar produtos current_weather, forecast_5d_3h, air_pollution, air_pollution_forecast ou "all".
 4. Definir snapshot_at em UTC arredondado para minuto.
-5. Enviar mensagens para SQS FIFO.
+5. Enviar mensagens para SQS FIFO em lotes de 10.
 6. Usar MessageGroupId por UF.
 7. Usar MessageDeduplicationId derivado do conteudo do job.
+8. Consultar a metrica OpenWeatherApiCalls do mes e nao enfileirar jobs que ultrapassem o teto.
 
 LAMBDA COLLECTOR
 
@@ -99,49 +112,57 @@ A Collector deve:
 
 1. Processar lotes da SQS.
 2. Implementar partial batch response.
-3. Ler appid da OpenWeather no SSM SecureString.
+3. Ler appid da OpenWeather no SSM SecureString (cache curto, descartado em HTTP 401).
 4. Nunca registrar appid.
 5. Chamar o endpoint correto conforme product.
-6. Validar resposta JSON.
-7. Tratar 429 e 5xx como retry.
+6. Validar resposta JSON por produto.
+7. Tratar 401, 408, 425, 429 e 5xx como retry; descartar 400/403/404 e payloads invalidos.
 8. Gravar raw JSON no S3.
 9. Usar chave S3 deterministica por produto, capital e snapshot_at.
 10. Usar If-None-Match igual a "*".
+11. Publicar metricas EMF no stdout (OpenWeatherApiCalls, SourceJobsCollected, SourceJobFailures, SourceJobsRejected).
 
 LAMBDA CURATOR
 
 A Curator deve:
 
-1. Ler uma hora fechada de raw/current_weather.
-2. Extrair campos climaticos principais.
-3. Agrupar por capital e hora.
-4. Gerar uma tabela Parquet com uma linha por capital por hora.
-5. Separar colunas de data, hora, ano, mes e dia.
-6. Gravar em curated/hourly_observations/.
-7. Ser executavel manualmente e por schedule quando habilitado.
+1. Verificar as ultimas horas fechadas e reconstruir as que nao tem arquivo curado.
+2. Aceitar target_hour e intervalos start_hour/end_hour para backfill.
+3. Gerar uma tabela Parquet com uma linha por capital por hora, unindo Current Weather e Air Pollution.
+4. Contar cada observacao distinta (dt) uma unica vez e tratar rain.1h como intensidade (mm/h).
+5. Separar colunas de data, hora, ano, mes, dia e data/hora local.
+6. Gravar a previsao 5 dias / 3 horas em curated/forecast_3h/.
+7. Gerar agregados diarios por data local quando o dia estiver encerrado.
+8. Publicar as series JSON do dashboard no bucket do site.
+
+LAMBDA PUBLISHER
+
+A Publisher deve:
+
+1. Ler a observacao e a qualidade do ar mais recentes de cada capital.
+2. Manter o ultimo valor conhecido de capitais sem dado novo.
+3. Incluir o consumo mensal da OpenWeather.
+4. Gravar data/latest.json no bucket do site.
 
 S3 RAW
 
-Chave:
-
 raw/source=openweather-free-plan/product=<produto>/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/state=<uf>/city=<cidade>/openweather_<produto>_<uf>_<cidade>_<timestamp>.json
 
-S3 CURATED HORARIO
-
-Chave:
+S3 CURATED
 
 curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<timestamp>.parquet
+curated/daily_observations/year=<yyyy>/month=<mm>/day=<dd>/weather_daily_observations_<yyyymmdd>.parquet
+curated/forecast_3h/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_forecast_3h_<timestamp>.parquet
 
-AGREGACAO FUTURA
+DASHBOARD
 
-Quando houver dados suficientes, criar camada curated com:
+Site estatico em frontend/, servido pelo CloudFront, com:
 
-- media por hora.
-- media diaria.
-- min/max por periodo.
-- acumulado de chuva.
-- comparacao entre capitais.
-- tendencia por semanas, meses e anos.
+- visao geral das 27 capitais (destaques, ranking, resumo por regiao);
+- pagina por capital (condicoes atuais, qualidade do ar, previsao, ultimas horas, historico por dia/semana/mes/ano);
+- comparacao de ate 4 capitais;
+- situacao do pipeline e consumo da API;
+- tema claro/escuro, tabela equivalente para cada grafico e layout responsivo.
 
 COMANDOS
 
@@ -149,14 +170,24 @@ Testes:
 
 ./scripts/test.ps1
 
-Deploy:
+Pre-visualizar o dashboard sem AWS:
 
-./scripts/deploy.ps1 -StackName weather-data-pipeline-dev -Environment dev -Region sa-east-1 -MonthlyOperationalCallLimit 500000
+./scripts/preview-frontend.ps1
 
-Cadastrar chave:
+Pipeline local com a API real:
 
-./scripts/set-openweather-key.ps1 -ApiKey "<OPENWEATHER_API_KEY>" -Environment dev -Region sa-east-1
+./scripts/run-local-pipeline.ps1 -States SP,RJ -Serve
 
-Invocar planejamento:
+Deploy completo (build, deploy, chave no SSM a partir do .env, frontend e primeira coleta):
 
-./scripts/invoke-planner.ps1 -StackName weather-data-pipeline-dev -Region sa-east-1
+./scripts/deploy.ps1 -StackName weather-data-pipeline-dev -Environment dev -Region sa-east-1 -EnableSchedules true -BudgetAlertEmail "seu-email@example.com" -RunInitialCollection
+
+Cadastrar ou trocar a chave:
+
+./scripts/set-openweather-key.ps1 -Environment dev -Region sa-east-1
+
+Invocar manualmente:
+
+./scripts/invoke-planner.ps1 -Products all
+./scripts/invoke-curator.ps1 -StartHour "2026-06-25T00:00:00Z" -EndHour "2026-06-25T23:00:00Z"
+./scripts/invoke-publisher.ps1
