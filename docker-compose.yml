@@ -1,5 +1,35 @@
 services:
+  # Offline mode: collects OpenWeather on the cloud cadence, curates the Parquet tables and serves the
+  # dashboard at http://localhost:8000. Needs only OPENWEATHER_API_KEY in .env.
+  #   docker compose up -d          start (restarts automatically with Docker)
+  #   docker compose logs -f        follow the log
+  #   docker compose down           stop (data stays in .local-data/ and frontend/data/)
+  weather:
+    build: .
+    image: weather-data-pipeline-offline
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Optional overrides; defaults mirror the cloud cadence.
+      OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY:-}
+    command:
+      - python
+      - scripts/offline_service.py
+      - --host
+      - 0.0.0.0
+      - --interval-minutes
+      - ${OFFLINE_INTERVAL_MINUTES:-3}
+    volumes:
+      - ./.local-data:/app/.local-data
+      - ./frontend/data:/app/frontend/data
+
+  # Optional AWS emulator for experiments: docker compose --profile localstack up -d localstack
   localstack:
+    profiles: ["localstack"]
     image: localstack/localstack:3.5
     ports:
       - "4566:4566"

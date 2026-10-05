@@ -1,27 +1,67 @@
 # Runbook de incidentes
 
-## Chave ausente ou invalida
+Todos os alarmes publicam no topico SNS `<stack>-alerts` (e-mail definido em `BudgetAlertEmail`). Visao geral: dashboard CloudWatch `<stack>-operations` (output `OperationsDashboardUrl`).
 
-Sintoma: Collector falha ao ler SSM ou OpenWeather retorna 401.
+## `<stack>-source-rejected` ou `<stack>-collector-errors`
 
-Acao:
+Sintoma: a OpenWeather respondeu erro. Rejeitados (400/403/404, payload inesperado) sao descartados; falhas transitorias (401, 429, 5xx, timeout) sao repetidas ate 3 vezes dentro da coleta, e a coleta so volta para a fila se todas as capitais falharem. Cada linha `source_batch_processed` lista `failures` e `rejected` por UF.
+
+1. CloudWatch Logs Insights na Collector:
+
+   ```text
+   fields @timestamp, @message
+   | filter @message like /source_batch_failed|"failures":\[\{|"rejected":\[\{/
+   | sort @timestamp desc
+   | limit 50
+   ```
+
+2. `status_code = 401`: chave invalida ou ainda nao ativada.
+
+   ```powershell
+   ./scripts/set-openweather-key.ps1 -Environment dev -Region sa-east-1
+   ```
+
+   A Collector descarta a chave em cache no proximo 401; nao precisa redeploy.
+3. `status_code = 429`: limite por minuto. Confirme se ha outro sistema usando a mesma chave; se necessario aumente `CurrentWeatherIntervalMinutes`.
+
+## `<stack>-collection-stalled`
+
+Nenhum snapshot gravado em 30 minutos com agenda ligada. Verifique, nesta ordem: regras do EventBridge habilitadas, erros da Planner (`<stack>-planner-errors`), alarme de teto mensal, mensagens na DLQ e logs da Collector.
+
+## `<stack>-monthly-call-limit`
+
+A Planner suspendeu coletas porque o contador mensal (parametro SSM `/<stack>/openweather-call-counter`) atingiu o teto. Elas voltam sozinhas no dia 1. Para liberar antes, aumente `MonthlyOperationalCallLimit` (maximo 500.000) ou reduza a cadencia. Para uma coleta pontual: `./scripts/invoke-planner.ps1 -Products current_weather -SkipBudgetCheck`.
+
+## `<stack>-source-dlq-visible`
+
+Mensagens que falharam 3 vezes. Inspecione:
 
 ```powershell
-./scripts/set-openweather-key.ps1 -ApiKey "<OPENWEATHER_API_KEY>" -Environment dev -Region sa-east-1
+aws sqs receive-message --queue-url "<DeadLetterQueueUrl>" --max-number-of-messages 10 --region sa-east-1
 ```
 
-## Limite excedido
+Current Weather reprocessada tarde grava dados do momento do reprocessamento; normalmente e melhor descartar (`aws sqs purge-queue --queue-url "<DeadLetterQueueUrl>"`). Previsoes e qualidade do ar podem ser coletadas de novo com `./scripts/invoke-planner.ps1 -Products forecast_5d_3h,air_pollution`.
 
-Sintoma: OpenWeather retorna 429.
+## `<stack>-curator-errors`
 
-Acao: desabilite os schedules, aguarde a janela de limite e reduza a frequencia se necessario.
-
-## Inspecionar DLQ
+A proxima execucao recupera as horas faltantes das ultimas 6 horas. Para periodos maiores (dentro da retencao do raw):
 
 ```powershell
-aws sqs receive-message --queue-url "<DeadLetterQueueUrl>" --max-number-of-messages 10
+./scripts/invoke-curator.ps1 -StartHour "2026-06-24T00:00:00Z" -EndHour "2026-06-25T23:00:00Z" -RebuildServing
 ```
+
+## `<stack>-publisher-errors`
+
+O dashboard continua mostrando o ultimo `data/latest.json`. Verifique os logs da Publisher e rode `./scripts/invoke-publisher.ps1`.
+
+## Dashboard desatualizado
+
+O frontend mostra um aviso quando a observacao mais recente tem mais de 45 minutos. Verifique se `EnableSchedules=true` e se os alarmes acima estao em OK. Para republicar so o site: `./scripts/publish-frontend.ps1`.
 
 ## Localizar uma coleta
 
-Procure por `state`, `city`, `product` e `snapshot_at` nos logs da Collector no CloudWatch.
+Procure por `product` e `snapshot_at` nos logs da Collector (`source_batch_processed` traz `s3_key`, um objeto com as 27 capitais).
+
+## Modo offline
+
+O servico offline registra tudo em `.local-data/logs/offline-service.log` (ou `docker compose logs weather`). Coletas com problema aparecem como `WARNING collected ...` com a UF e o erro; o teto mensal aparece como `collection skipped: monthly limit reached`. O contador fica em `.local-data/state/call-counter.json`.

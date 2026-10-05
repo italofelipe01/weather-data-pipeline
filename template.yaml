@@ -1,17 +1,32 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  AWS SAM template for collecting temporal weather snapshots with OpenWeather Free plan APIs.
+  Serverless weather time series for the 27 Brazilian capitals built only with OpenWeather Free plan APIs
+  (Current Weather, 5 Day / 3 Hour Forecast and Air Pollution), with curated Parquet tables, Athena tables
+  and a static dashboard served by CloudFront.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Pipeline}
+        Parameters: [Environment, EnableSchedules, CurrentWeatherIntervalMinutes, EnableAirPollution, OpenWeatherApiKeyParameterName]
+      - Label: {default: Cost controls}
+        Parameters: [MonthlyOperationalCallLimit, RawDataRetentionDays, LogRetentionDays, MonthlyBudgetAmount, BudgetAlertEmail]
+      - Label: {default: Consumption}
+        Parameters: [EnableFrontend, EnableAnalytics]
 
 Globals:
   Function:
     Runtime: python3.13
+    Architectures: [x86_64]
     Timeout: 60
     MemorySize: 256
     Environment:
       Variables:
+        PIPELINE_NAME: !Ref AWS::StackName
+        METRICS_NAMESPACE: WeatherDataPipeline
         API_KEY_CACHE_TTL_SECONDS: "300"
-        SOURCE_TIMEOUT_SECONDS: "30"
+        SOURCE_TIMEOUT_SECONDS: "8"
 
 Parameters:
   Environment:
@@ -20,20 +35,31 @@ Parameters:
     AllowedPattern: "^[a-z][a-z0-9-]{1,15}$"
   OpenWeatherApiKeyParameterName:
     Type: String
-    Default: /weather-data-pipeline/dev/openweather-api-key
-    Description: SecureString parameter created externally with the OpenWeather API key.
+    Default: ""
+    AllowedPattern: "^$|^/[A-Za-z0-9_.\\-/]+$"
+    Description: SecureString parameter with the OpenWeather API key. Empty uses /weather-data-pipeline/<Environment>/openweather-api-key.
   MonthlyOperationalCallLimit:
     Type: Number
     Default: 500000
     MinValue: 1
     MaxValue: 500000
-    Description: 50 percent of the documented 1,000,000 calls/month Free plan limit.
+    Description: Enforced by the Planner. 50 percent of the documented 1,000,000 calls/month Free plan limit.
+  CurrentWeatherIntervalMinutes:
+    Type: Number
+    Default: 3
+    AllowedValues: [3, 5, 10, 15, 30]
+    Description: Current Weather cadence in minutes. The default (3) keeps the projected total near 445,000 calls in a 31-day month.
+  EnableAirPollution:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Collect the free Air Pollution API (hourly current values and a 4-day forecast every 6 hours).
   RawDataRetentionDays:
     Type: Number
     Default: 30
     MinValue: 1
     MaxValue: 90
-    Description: Raw JSON retention. Keep short because curated aggregates are the long-term layer.
+    Description: Raw JSON retention. Keep short because curated tables are the long-term layer.
   LogRetentionDays:
     Type: Number
     Default: 7
@@ -48,15 +74,29 @@ Parameters:
   BudgetAlertEmail:
     Type: String
     Default: ""
-    Description: Optional email for AWS Budget alerts. Leave empty to skip budget creation.
+    Description: Optional email for AWS Budget alerts and pipeline alarms (SNS). Leave empty to skip both subscriptions.
   EnableSchedules:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+  EnableFrontend:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Serve the dashboard through CloudFront (Free tier covers 1 TB and 10M requests per month).
+  EnableAnalytics:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Glue Data Catalog tables with partition projection plus an Athena workgroup capped at 1 GB scanned per query. No crawler, no idle cost.
 
 Conditions:
   SchedulesEnabled: !Equals [!Ref EnableSchedules, "true"]
+  AirPollutionSchedulesEnabled: !And [!Condition SchedulesEnabled, !Equals [!Ref EnableAirPollution, "true"]]
   BudgetAlertsEnabled: !Not [!Equals [!Ref BudgetAlertEmail, ""]]
+  FrontendEnabled: !Equals [!Ref EnableFrontend, "true"]
+  AnalyticsEnabled: !Equals [!Ref EnableAnalytics, "true"]
+  HasCustomApiKeyParameter: !Not [!Equals [!Ref OpenWeatherApiKeyParameterName, ""]]
 
 Resources:
   RawDataBucket:
@@ -86,6 +126,10 @@ Resources:
             Status: Enabled
             Prefix: tmp/
             ExpirationInDays: 7
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
           - Id: abort-incomplete-multipart
             Status: Enabled
             AbortIncompleteMultipartUpload:
@@ -109,6 +153,155 @@ Resources:
               Bool:
                 aws:SecureTransport: false
 
+  # Static dashboard (frontend/) plus the JSON documents under data/ written by the Curator and the Publisher.
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+        IgnorePublicAcls: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub "${SiteBucket.Arn}"
+              - !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - !If
+            - FrontendEnabled
+            - Sid: AllowCloudFrontRead
+              Effect: Allow
+              Principal:
+                Service: cloudfront.amazonaws.com
+              Action: s3:GetObject
+              Resource: !Sub "${SiteBucket.Arn}/*"
+              Condition:
+                StringEquals:
+                  AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+            - !Ref AWS::NoValue
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: FrontendEnabled
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-site"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDataCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: FrontendEnabled
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-data"
+        Comment: Short TTL for dashboard JSON refreshed every 10 minutes.
+        DefaultTTL: 60
+        MaxTTL: 300
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  SiteResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Condition: FrontendEnabled
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-security-headers"
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'"
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: FrontendEnabled
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} weather dashboard"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SiteResponseHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: data/*
+            TargetOriginId: site
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: !Ref SiteDataCachePolicy
+            ResponseHeadersPolicyId: !Ref SiteResponseHeadersPolicy
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      DisplayName: Weather pipeline alerts
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: BudgetAlertsEnabled
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref BudgetAlertEmail
+
   DeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -123,16 +316,42 @@ Resources:
       FifoQueue: true
       ContentBasedDeduplication: false
       QueueName: !Sub "${AWS::StackName}-source.fifo"
-      VisibilityTimeout: 180
+      # AWS recommends at least six times the consumer timeout for SQS event sources.
+      VisibilityTimeout: 1800
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
         maxReceiveCount: 3
+
+  # Month-to-date OpenWeather calls planned by the Planner. Standard String parameters are free, unlike
+  # CloudWatch GetMetricData, so the monthly limit costs nothing to enforce.
+  CallCounterParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/openweather-call-counter"
+      Type: String
+      Tier: Standard
+      Value: '{"month":"","calls":0}'
+      Description: Month-to-date OpenWeather calls (updated by the Planner, read by the Publisher).
+
+  AnalyticsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-analytics"
+      Description: pyarrow for the Parquet curated tables (Curator only).
+      ContentUri: layers/analytics/
+      CompatibleRuntimes: [python3.13]
+      CompatibleArchitectures: [x86_64]
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.13
+      BuildArchitecture: x86_64
 
   PlannerFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: planner.handler.lambda_handler
+      Description: Plans one OpenWeather job per capital and product and enforces the monthly call limit.
       Environment:
         Variables:
           COLLECTION_QUEUE_URL: !Ref CollectionQueue
@@ -140,6 +359,7 @@ Resources:
           OPENWEATHER_LANG: pt_br
           OPENWEATHER_PRODUCTS: current_weather
           MONTHLY_OPERATIONAL_CALL_LIMIT: !Ref MonthlyOperationalCallLimit
+          CALL_COUNTER_PARAMETER_NAME: !Ref CallCounterParameter
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -147,12 +367,17 @@ Resources:
               Action:
                 - sqs:SendMessage
               Resource: !GetAtt CollectionQueue.Arn
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:PutParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CallCounterParameter}"
       Events:
         CurrentWeatherPlan:
           Type: Schedule
           Properties:
             Enabled: !If [SchedulesEnabled, true, false]
-            Schedule: rate(3 minutes)
+            Schedule: !Sub "cron(0/${CurrentWeatherIntervalMinutes} * * * ? *)"
             Input: '{"products": ["current_weather"]}'
         ForecastPlan:
           Type: Schedule
@@ -160,63 +385,149 @@ Resources:
             Enabled: !If [SchedulesEnabled, true, false]
             Schedule: cron(5 * * * ? *)
             Input: '{"products": ["forecast_5d_3h"]}'
+        AirPollutionPlan:
+          Type: Schedule
+          Properties:
+            Enabled: !If [AirPollutionSchedulesEnabled, true, false]
+            Schedule: cron(35 * * * ? *)
+            Input: '{"products": ["air_pollution"]}'
+        AirPollutionForecastPlan:
+          Type: Schedule
+          Properties:
+            Enabled: !If [AirPollutionSchedulesEnabled, true, false]
+            Schedule: cron(50 0/6 * * ? *)
+            Input: '{"products": ["air_pollution_forecast"]}'
 
   CollectorFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: collector.handler.lambda_handler
+      Description: Collects one product snapshot for every capital (paced under 60 calls/minute) and stores it as a single raw object.
+      # I/O bound: 128 MB keeps ~16k batches/month well inside the Lambda free tier.
+      MemorySize: 128
+      Timeout: 300
       Environment:
         Variables:
           RAW_DATA_BUCKET_NAME: !Ref RawDataBucket
-          OPENWEATHER_API_KEY_PARAMETER_NAME: !Ref OpenWeatherApiKeyParameterName
+          OPENWEATHER_API_KEY_PARAMETER_NAME: !If [HasCustomApiKeyParameter, !Ref OpenWeatherApiKeyParameterName, !Sub "/weather-data-pipeline/${Environment}/openweather-api-key"]
       Policies:
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
               Action:
                 - s3:PutObject
-              Resource: !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}/*"
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}/raw/*"
             - Effect: Allow
               Action:
                 - ssm:GetParameter
-              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenWeatherApiKeyParameterName}"
+              Resource: !If
+                - HasCustomApiKeyParameter
+                - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenWeatherApiKeyParameterName}"
+                - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/weather-data-pipeline/${Environment}/openweather-api-key"
       Events:
         CollectionQueueEvent:
           Type: SQS
           Properties:
             Queue: !GetAtt CollectionQueue.Arn
-            BatchSize: 5
+            # Each message is a whole snapshot (27 capitals, ~30 s with 1.1 s between calls).
+            BatchSize: 1
             FunctionResponseTypes:
               - ReportBatchItemFailures
+            ScalingConfig:
+              # At most two snapshots in flight, which the schedule offsets keep under 60 calls/minute.
+              MaximumConcurrency: 2
 
   CuratorFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: curator.handler.lambda_handler
-      Timeout: 120
+      Description: Builds hourly, daily and forecast Parquet tables, catches up missed hours and publishes dashboard series.
+      Timeout: 300
+      MemorySize: 1024
+      Layers:
+        - !Ref AnalyticsLayer
       Environment:
         Variables:
           RAW_DATA_BUCKET_NAME: !Ref RawDataBucket
+          SITE_BUCKET_NAME: !Ref SiteBucket
+          CURATOR_LOOKBACK_HOURS: "6"
+          DAILY_LOOKBACK_DAYS: "3"
+          SERVING_HOURLY_DAYS: "7"
+          SERVING_DAILY_DAYS: "730"
       Policies:
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
               Action:
                 - s3:ListBucket
-              Resource: !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}"
+              Resource:
+                - !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}"
+                - !Sub "arn:${AWS::Partition}:s3:::${SiteBucket}"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}/*"
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}/curated/*"
             - Effect: Allow
               Action:
                 - s3:GetObject
                 - s3:PutObject
-              Resource: !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}/*"
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${SiteBucket}/data/*"
       Events:
         HourlyCuratorPlan:
           Type: Schedule
           Properties:
             Enabled: !If [SchedulesEnabled, true, false]
             Schedule: cron(20 * * * ? *)
+            Input: '{}'
+
+  PublisherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: publisher.handler.lambda_handler
+      Description: Publishes the latest observation and air quality per capital (data/latest.json) for the dashboard.
+      Timeout: 120
+      Environment:
+        Variables:
+          RAW_DATA_BUCKET_NAME: !Ref RawDataBucket
+          SITE_BUCKET_NAME: !Ref SiteBucket
+          LATEST_LOOKBACK_HOURS: "3"
+          MONTHLY_OPERATIONAL_CALL_LIMIT: !Ref MonthlyOperationalCallLimit
+          CALL_COUNTER_PARAMETER_NAME: !Ref CallCounterParameter
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource:
+                - !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}"
+                - !Sub "arn:${AWS::Partition}:s3:::${SiteBucket}"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${RawDataBucket}/raw/*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${SiteBucket}/data/*"
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CallCounterParameter}"
+      Events:
+        LatestPublishPlan:
+          Type: Schedule
+          Properties:
+            Enabled: !If [SchedulesEnabled, true, false]
+            Schedule: rate(10 minutes)
             Input: '{}'
 
   PlannerLogGroup:
@@ -235,6 +546,12 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${CuratorFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  PublisherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PublisherFunction}"
       RetentionInDays: !Ref LogRetentionDays
 
   MonthlyCostBudget:
@@ -274,21 +591,99 @@ Resources:
             - SubscriptionType: EMAIL
               Address: !Ref BudgetAlertEmail
 
+  # Alarms stay within the CloudWatch free tier (10 alarm metrics) and notify AlertTopic.
   CollectorErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub "${AWS::StackName}-collector-errors"
+      AlarmDescription: OpenWeather jobs are failing and being retried (HTTP 429/5xx, timeouts or an invalid API key).
       Namespace: WeatherDataPipeline
       MetricName: SourceJobFailures
       Dimensions:
-        - Name: FunctionName
-          Value: !Ref CollectorFunction
+        - Name: Pipeline
+          Value: !Ref AWS::StackName
       Statistic: Sum
-      Period: 300
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  SourceRejectedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-source-rejected"
+      AlarmDescription: OpenWeather answered with a non-retryable error or an unexpected payload; those jobs were dropped.
+      Namespace: WeatherDataPipeline
+      MetricName: SourceJobsRejected
+      Dimensions:
+        - Name: Pipeline
+          Value: !Ref AWS::StackName
+      Statistic: Sum
+      Period: 900
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  CallBudgetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-monthly-call-limit"
+      AlarmDescription: The Planner skipped collections because MonthlyOperationalCallLimit was reached.
+      Namespace: WeatherDataPipeline
+      MetricName: CollectionJobsSkipped
+      Dimensions:
+        - Name: Pipeline
+          Value: !Ref AWS::StackName
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  CollectionStalledAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: SchedulesEnabled
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-collection-stalled"
+      AlarmDescription: No OpenWeather snapshot was stored for 30 minutes while schedules are enabled.
+      Namespace: WeatherDataPipeline
+      MetricName: SourceJobsCollected
+      Dimensions:
+        - Name: Pipeline
+          Value: !Ref AWS::StackName
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  PlannerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-planner-errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PlannerFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
 
   CuratorErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -305,6 +700,24 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  PublisherErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-publisher-errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PublisherFunction
+      Statistic: Sum
+      Period: 1800
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
 
   DlqVisibleMessagesAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -315,12 +728,14 @@ Resources:
       Dimensions:
         - Name: QueueName
           Value: !GetAtt DeadLetterQueue.QueueName
-      Statistic: Sum
+      Statistic: Maximum
       Period: 300
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
 
   OldestMessageAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -337,10 +752,338 @@ Resources:
       Threshold: 900
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-operations"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+              "title": "OpenWeather calls and stored snapshots", "region": "${AWS::Region}", "stat": "Sum", "period": 3600, "view": "timeSeries",
+              "metrics": [
+                ["WeatherDataPipeline", "OpenWeatherApiCalls", "Pipeline", "${AWS::StackName}"],
+                [".", "SourceJobsCollected", ".", "."],
+                [".", "SourceJobFailures", ".", "."],
+                [".", "SourceJobsRejected", ".", "."],
+                [".", "SourceJobsExpired", ".", "."]
+              ]}},
+            {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+              "title": "OpenWeather calls this month (limit ${MonthlyOperationalCallLimit})", "region": "${AWS::Region}", "stat": "Sum", "period": 2592000, "view": "singleValue",
+              "metrics": [["WeatherDataPipeline", "OpenWeatherApiCalls", "Pipeline", "${AWS::StackName}"]]}},
+            {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+              "title": "Lambda errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+              "metrics": [
+                ["AWS/Lambda", "Errors", "FunctionName", "${PlannerFunction}"],
+                ["...", "${CollectorFunction}"],
+                ["...", "${CuratorFunction}"],
+                ["...", "${PublisherFunction}"]
+              ]}},
+            {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+              "title": "Queues", "region": "${AWS::Region}", "stat": "Maximum", "period": 300, "view": "timeSeries",
+              "metrics": [
+                ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${CollectionQueue.QueueName}"],
+                ["...", "${DeadLetterQueue.QueueName}"],
+                [".", "ApproximateAgeOfOldestMessage", ".", "${CollectionQueue.QueueName}"]
+              ]}},
+            {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
+              "title": "Curated hourly rows", "region": "${AWS::Region}", "stat": "Sum", "period": 3600, "view": "timeSeries",
+              "metrics": [
+                ["WeatherDataPipeline", "HourlyObservationRecords", "Pipeline", "${AWS::StackName}"],
+                [".", "CuratedHours", ".", "."],
+                [".", "CollectionJobsSkipped", ".", "."]
+              ]}},
+            {"type": "metric", "x": 12, "y": 12, "width": 12, "height": 6, "properties": {
+              "title": "Lambda duration (p95)", "region": "${AWS::Region}", "stat": "p95", "period": 3600, "view": "timeSeries",
+              "metrics": [
+                ["AWS/Lambda", "Duration", "FunctionName", "${CollectorFunction}"],
+                ["...", "${CuratorFunction}"],
+                ["...", "${PublisherFunction}"]
+              ]}}
+          ]
+        }
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Condition: AnalyticsEnabled
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Join ["_", ["weather", !Join ["_", !Split ["-", !Ref Environment]]]]
+        Description: Curated OpenWeather tables for the Brazilian capitals (partition projection, no crawler).
+
+  HourlyObservationsTable:
+    Type: AWS::Glue::Table
+    Condition: AnalyticsEnabled
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: weather_hourly_observations
+        Description: One row per capital per UTC hour (current weather + air pollution).
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          EXTERNAL: "TRUE"
+          projection.enabled: "true"
+          projection.year.type: integer
+          projection.year.range: "2025,2035"
+          projection.month.type: integer
+          projection.month.range: "1,12"
+          projection.month.digits: "2"
+          projection.day.type: integer
+          projection.day.range: "1,31"
+          projection.day.digits: "2"
+          projection.hour.type: integer
+          projection.hour.range: "0,23"
+          projection.hour.digits: "2"
+          storage.location.template: !Sub "s3://${RawDataBucket}/curated/hourly_observations/year=${!year}/month=${!month}/day=${!day}/hour=${!hour}/"
+        PartitionKeys:
+          - {Name: year, Type: int}
+          - {Name: month, Type: int}
+          - {Name: day, Type: int}
+          - {Name: hour, Type: int}
+        StorageDescriptor:
+          Location: !Sub "s3://${RawDataBucket}/curated/hourly_observations/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: observation_date, Type: date}
+            - {Name: observation_hour, Type: smallint}
+            - {Name: observation_timestamp, Type: timestamp}
+            - {Name: local_date, Type: date}
+            - {Name: local_hour, Type: smallint}
+            - {Name: city, Type: string}
+            - {Name: state, Type: string}
+            - {Name: region, Type: string}
+            - {Name: ibge_code, Type: string}
+            - {Name: latitude, Type: double}
+            - {Name: longitude, Type: double}
+            - {Name: temperature_avg, Type: double}
+            - {Name: temperature_min, Type: double}
+            - {Name: temperature_max, Type: double}
+            - {Name: feels_like_avg, Type: double}
+            - {Name: humidity_avg, Type: double}
+            - {Name: humidity_min, Type: double}
+            - {Name: humidity_max, Type: double}
+            - {Name: pressure_avg, Type: double}
+            - {Name: sea_level_pressure_avg, Type: double}
+            - {Name: ground_level_pressure_avg, Type: double}
+            - {Name: wind_speed_avg, Type: double}
+            - {Name: wind_speed_max, Type: double}
+            - {Name: wind_gust_max, Type: double}
+            - {Name: wind_deg_avg, Type: double}
+            - {Name: clouds_avg, Type: double}
+            - {Name: visibility_avg, Type: double}
+            - {Name: rain_mm, Type: double}
+            - {Name: rain_rate_max, Type: double}
+            - {Name: snow_mm, Type: double}
+            - {Name: weather_id, Type: int}
+            - {Name: weather_main, Type: string}
+            - {Name: weather_description, Type: string}
+            - {Name: weather_icon, Type: string}
+            - {Name: sunrise, Type: timestamp}
+            - {Name: sunset, Type: timestamp}
+            - {Name: aqi, Type: tinyint}
+            - {Name: co, Type: double}
+            - {Name: "no", Type: double}
+            - {Name: no2, Type: double}
+            - {Name: o3, Type: double}
+            - {Name: so2, Type: double}
+            - {Name: pm2_5, Type: double}
+            - {Name: pm10, Type: double}
+            - {Name: nh3, Type: double}
+            - {Name: sample_count, Type: smallint}
+            - {Name: observation_count, Type: smallint}
+            - {Name: air_sample_count, Type: smallint}
+            - {Name: source_product, Type: string}
+            - {Name: processed_at, Type: timestamp}
+
+  DailyObservationsTable:
+    Type: AWS::Glue::Table
+    Condition: AnalyticsEnabled
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: weather_daily_observations
+        Description: One row per capital per local day, derived from the hourly table.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          EXTERNAL: "TRUE"
+          projection.enabled: "true"
+          projection.year.type: integer
+          projection.year.range: "2025,2035"
+          projection.month.type: integer
+          projection.month.range: "1,12"
+          projection.month.digits: "2"
+          projection.day.type: integer
+          projection.day.range: "1,31"
+          projection.day.digits: "2"
+          storage.location.template: !Sub "s3://${RawDataBucket}/curated/daily_observations/year=${!year}/month=${!month}/day=${!day}/"
+        PartitionKeys:
+          - {Name: year, Type: int}
+          - {Name: month, Type: int}
+          - {Name: day, Type: int}
+        StorageDescriptor:
+          Location: !Sub "s3://${RawDataBucket}/curated/daily_observations/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: observation_date, Type: date}
+            - {Name: city, Type: string}
+            - {Name: state, Type: string}
+            - {Name: region, Type: string}
+            - {Name: ibge_code, Type: string}
+            - {Name: latitude, Type: double}
+            - {Name: longitude, Type: double}
+            - {Name: temperature_avg, Type: double}
+            - {Name: temperature_min, Type: double}
+            - {Name: temperature_max, Type: double}
+            - {Name: temperature_amplitude, Type: double}
+            - {Name: feels_like_avg, Type: double}
+            - {Name: feels_like_max, Type: double}
+            - {Name: humidity_avg, Type: double}
+            - {Name: humidity_min, Type: double}
+            - {Name: humidity_max, Type: double}
+            - {Name: pressure_avg, Type: double}
+            - {Name: wind_speed_avg, Type: double}
+            - {Name: wind_speed_max, Type: double}
+            - {Name: wind_gust_max, Type: double}
+            - {Name: clouds_avg, Type: double}
+            - {Name: visibility_avg, Type: double}
+            - {Name: rain_mm, Type: double}
+            - {Name: rain_hours, Type: smallint}
+            - {Name: snow_mm, Type: double}
+            - {Name: weather_main, Type: string}
+            - {Name: weather_description, Type: string}
+            - {Name: weather_icon, Type: string}
+            - {Name: sunrise, Type: timestamp}
+            - {Name: sunset, Type: timestamp}
+            - {Name: aqi_avg, Type: double}
+            - {Name: aqi_max, Type: tinyint}
+            - {Name: pm2_5_avg, Type: double}
+            - {Name: pm10_avg, Type: double}
+            - {Name: o3_avg, Type: double}
+            - {Name: no2_avg, Type: double}
+            - {Name: so2_avg, Type: double}
+            - {Name: co_avg, Type: double}
+            - {Name: hours_observed, Type: smallint}
+            - {Name: sample_count, Type: int}
+            - {Name: processed_at, Type: timestamp}
+
+  ForecastTable:
+    Type: AWS::Glue::Table
+    Condition: AnalyticsEnabled
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: weather_forecast_3h
+        Description: 5 day / 3 hour forecasts per capital, partitioned by the hour they were issued.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          EXTERNAL: "TRUE"
+          projection.enabled: "true"
+          projection.year.type: integer
+          projection.year.range: "2025,2035"
+          projection.month.type: integer
+          projection.month.range: "1,12"
+          projection.month.digits: "2"
+          projection.day.type: integer
+          projection.day.range: "1,31"
+          projection.day.digits: "2"
+          projection.hour.type: integer
+          projection.hour.range: "0,23"
+          projection.hour.digits: "2"
+          storage.location.template: !Sub "s3://${RawDataBucket}/curated/forecast_3h/year=${!year}/month=${!month}/day=${!day}/hour=${!hour}/"
+        PartitionKeys:
+          - {Name: year, Type: int}
+          - {Name: month, Type: int}
+          - {Name: day, Type: int}
+          - {Name: hour, Type: int}
+        StorageDescriptor:
+          Location: !Sub "s3://${RawDataBucket}/curated/forecast_3h/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: issued_at, Type: timestamp}
+            - {Name: forecast_time, Type: timestamp}
+            - {Name: forecast_date, Type: date}
+            - {Name: forecast_hour, Type: smallint}
+            - {Name: local_forecast_date, Type: date}
+            - {Name: local_forecast_hour, Type: smallint}
+            - {Name: lead_hours, Type: double}
+            - {Name: city, Type: string}
+            - {Name: state, Type: string}
+            - {Name: region, Type: string}
+            - {Name: ibge_code, Type: string}
+            - {Name: latitude, Type: double}
+            - {Name: longitude, Type: double}
+            - {Name: temperature, Type: double}
+            - {Name: feels_like, Type: double}
+            - {Name: temperature_min, Type: double}
+            - {Name: temperature_max, Type: double}
+            - {Name: humidity, Type: double}
+            - {Name: pressure, Type: double}
+            - {Name: sea_level_pressure, Type: double}
+            - {Name: ground_level_pressure, Type: double}
+            - {Name: clouds, Type: double}
+            - {Name: wind_speed, Type: double}
+            - {Name: wind_deg, Type: double}
+            - {Name: wind_gust, Type: double}
+            - {Name: visibility, Type: double}
+            - {Name: pop, Type: double}
+            - {Name: rain_3h_mm, Type: double}
+            - {Name: snow_3h_mm, Type: double}
+            - {Name: weather_id, Type: int}
+            - {Name: weather_main, Type: string}
+            - {Name: weather_description, Type: string}
+            - {Name: weather_icon, Type: string}
+            - {Name: part_of_day, Type: string}
+            - {Name: city_population, Type: bigint}
+            - {Name: processed_at, Type: timestamp}
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Condition: AnalyticsEnabled
+    Properties:
+      Name: !Ref AWS::StackName
+      Description: Queries over the curated weather tables (1 GB scan cap per query).
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        BytesScannedCutoffPerQuery: 1073741824
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${RawDataBucket}/athena-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
 
 Outputs:
   RawDataBucketName:
     Value: !Ref RawDataBucket
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DashboardUrl:
+    Condition: FrontendEnabled
+    Value: !Sub "https://${SiteDistribution.DomainName}/"
+  SiteDistributionId:
+    Condition: FrontendEnabled
+    Value: !Ref SiteDistribution
   CollectionQueueUrl:
     Value: !Ref CollectionQueue
   DeadLetterQueueUrl:
@@ -351,8 +1094,20 @@ Outputs:
     Value: !Ref CollectorFunction
   CuratorFunctionName:
     Value: !Ref CuratorFunction
+  PublisherFunctionName:
+    Value: !Ref PublisherFunction
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  OperationsDashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OperationsDashboard}"
+  GlueDatabaseName:
+    Condition: AnalyticsEnabled
+    Value: !Ref GlueDatabase
+  AthenaWorkGroupName:
+    Condition: AnalyticsEnabled
+    Value: !Ref AthenaWorkGroup
   OpenWeatherApiKeyParameterName:
-    Value: !Ref OpenWeatherApiKeyParameterName
+    Value: !If [HasCustomApiKeyParameter, !Ref OpenWeatherApiKeyParameterName, !Sub "/weather-data-pipeline/${Environment}/openweather-api-key"]
   MonthlyOperationalCallLimit:
     Value: !Ref MonthlyOperationalCallLimit
   RawDataRetentionDays:

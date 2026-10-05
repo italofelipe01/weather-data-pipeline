@@ -1,48 +1,51 @@
 # Estrategia de armazenamento
 
-O objetivo e evitar que o S3 vire um deposito permanente de milhoes de JSONs pequenos.
+O objetivo e evitar que o S3 vire um deposito permanente de milhoes de JSONs pequenos e manter uma camada curada compacta e consultavel.
 
-## Camadas
-
-```text
-raw/
-  snapshots brutos recebidos da OpenWeather
-  retencao curta: 30 dias por padrao
-
-curated/
-  arquivos tabulares e agregados
-  retencao longa na proxima etapa
-```
-
-## Por que expirar raw
-
-Com a cadencia padrao, o pipeline pode gerar cerca de 408.240 objetos por mes. Em seis meses isso passa de 2,4 milhoes de objetos se nada for expirado. O tamanho em GB tende a ser baixo, mas muitos objetos pequenos pioram listagem, manutencao e consultas futuras.
-
-## Tabela horaria atual
-
-A Lambda Curator ja cria a primeira tabela horaria em Parquet com compressao Snappy:
+## Buckets e camadas
 
 ```text
-curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<timestamp>.parquet
+<stack>-raw-<conta>-<regiao>
+  raw/             snapshots brutos da OpenWeather            expira em RawDataRetentionDays (30)
+  curated/         tabelas Parquet (Snappy)                   longo prazo
+  athena-results/  resultados do workgroup                    expira em 7 dias
+  tmp/, rejected/  reservados                                 expiram
+
+<stack>-sitebucket-*
+  index.html, assets/   dashboard (publish-frontend.ps1)
+  data/                 JSON do dashboard (Curator e Publisher)
 ```
 
-Essa tabela tem colunas separadas para `observation_date`, `observation_hour`, `year`, `month`, `day`, `city`, `state`, `temperature_avg`, `humidity_avg`, `rain_1h_sum` e demais metricas.
-
-## Proxima etapa recomendada
-
-Catalogar a tabela horaria no Glue Data Catalog e criar agregados diarios:
+## Chaves
 
 ```text
-curated/daily_observations/year=<yyyy>/month=<mm>/day=<dd>/part-000.parquet
+raw/source=openweather-free-plan/product=<produto>/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/openweather_<produto>_<yyyymmddThhmmZ>_<hash-das-UFs>.json
+curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<yyyymmddThh00Z>.parquet
+curated/daily_observations/year=<yyyy>/month=<mm>/day=<dd>/weather_daily_observations_<yyyymmdd>.parquet
+curated/forecast_3h/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_forecast_3h_<yyyymmddThh00Z>.parquet
 ```
 
-Preferencia:
+- Horaria: um arquivo por hora UTC com todas as capitais (clima + qualidade do ar).
+- Diaria: um arquivo por **data local**, todas as capitais.
+- Previsao: um arquivo por hora de emissao, com as 40 previsoes de cada capital.
 
-- um arquivo por hora contendo todas as capitais;
-- um arquivo por dia contendo agregados diarios;
-- Parquet com compressao Snappy;
-- particionamento por data e produto.
+As particoes `year/month/day/hour` sao lidas pelo Athena via partition projection (nao ha crawler). As tabelas tambem trazem `year`, `month` e `day` como colunas para facilitar leitura fora do Athena.
 
-## Politica atual
+## Por que expirar o raw
 
-O `template.yaml` define `RawDataRetentionDays=30` por padrao. Isso preserva uma janela suficiente para depuracao sem deixar o custo e o numero de objetos crescerem sem limite.
+Cada objeto raw guarda uma coleta inteira (`format: batch-v1`, lista `items` com `job` e `response` de cada capital e lista `failures`). Com a cadencia padrao sao cerca de 16,5 mil objetos por mes (~1 GB). Objetos da versao anterior, um por capital (`.../state=<uf>/city=<cidade>/openweather_<produto>_<uf>_<cidade>_<timestamp>.json`), continuam sendo lidos ate expirarem. O raw so e necessario para reprocessamento (`invoke-curator.ps1 -StartHour/-EndHour`), entao 30 dias bastam. A camada curada guarda ~720 arquivos horarios, ~720 de previsao e ~30 diarios por mes.
+
+## Compatibilidade
+
+Arquivos horarios gravados pela primeira versao (com `rain_1h_sum` somado por snapshot e sem data local) sao normalizados na leitura (`normalize_hourly_record`): `rain_mm = rain_1h_sum / sample_count` e a data local e calculada pelo fuso da capital. Para regrava-los no formato novo, reprocesse as horas com o raw ainda disponivel.
+
+## JSON do dashboard
+
+| Documento | Escrito por | Atualizacao | Conteudo |
+|---|---|---|---|
+| `data/latest.json` | Publisher | 10 min | observacao e qualidade do ar mais recentes das 27 capitais, consumo do mes |
+| `data/hourly/<uf>.json` | Curator | 1 h | 7 dias de linhas horarias |
+| `data/daily/<uf>.json` | Curator | quando um dia fecha | ate 730 dias (merge incremental; `rebuild_serving` refaz) |
+| `data/forecast/<uf>.json` | Curator | 1 h | previsao de 5 dias e de qualidade do ar de 4 dias |
+
+Capitais sem dado novo mantem o ultimo valor publicado, entao uma falha pontual nao apaga o dashboard.

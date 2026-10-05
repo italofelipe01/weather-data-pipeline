@@ -1,15 +1,18 @@
+-- Agregado diario por data LOCAL calculado direto da tabela horaria
+-- (a Curator ja grava esse resultado em weather_daily_observations).
+-- Chuva: rain_mm de cada hora ja e mm na hora; o dia e a soma.
 SELECT
-  observation_date,
+  local_date,
   state,
   city,
-  avg(temperature_avg) AS daily_temperature_avg,
+  round(avg(temperature_avg), 2) AS daily_temperature_avg,
   min(temperature_min) AS daily_temperature_min,
   max(temperature_max) AS daily_temperature_max,
-  avg(humidity_avg) AS daily_humidity_avg,
-  sum(rain_1h_sum) AS daily_rain_sum,
-  sum(sample_count) AS samples
+  round(avg(humidity_avg), 1) AS daily_humidity_avg,
+  round(sum(rain_mm), 2) AS daily_rain_mm,
+  count(*) AS hours_observed
 FROM weather_hourly_observations
 WHERE year = 2026
-  AND month = 6
-GROUP BY observation_date, state, city
-ORDER BY observation_date, state, city;
+  AND month = 10
+GROUP BY local_date, state, city
+ORDER BY local_date, state;

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Lint and format
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .
+
+      - name: Unit tests
+        run: python -m pytest
+
+      - name: Lint CloudFormation
+        run: cfn-lint template.yaml
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check frontend modules
+        run: for file in frontend/assets/*.js; do node --input-type=module --check < "$file"; done
+
+      - name: Synthetic end-to-end run (collector output -> curator -> publisher)
+        run: python scripts/sample_data.py --hours 6 --history-days 30
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Validate and build SAM application
+        run: |
+          sam validate --lint --region sa-east-1
+          sam build --no-use-container
+
+      - name: Build offline Docker image
+        run: docker build -t weather-data-pipeline-offline .

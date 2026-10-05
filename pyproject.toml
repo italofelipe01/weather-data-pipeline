@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "weather-data-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.13"
 
 [tool.pytest.ini_options]
 pythonpath = [".", "src"]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers --cov=planner.handler --cov=collector.handler --cov=curator.handler --cov=shared --cov-report=term-missing --cov-fail-under=80"
+addopts = "-ra --strict-markers --cov=planner.handler --cov=collector.handler --cov=curator.handler --cov=publisher.handler --cov=shared --cov-report=term-missing --cov-fail-under=80"
 markers = [
   "integration: requires LocalStack running at LOCALSTACK_ENDPOINT",
 ]

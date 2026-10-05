@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Clima das Capitais</title>
+    <meta name="description" content="Clima atual, previsão de 5 dias, qualidade do ar e histórico das 27 capitais brasileiras, com dados do plano gratuito da OpenWeather." />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/styles.css" />
+    <script type="module" src="assets/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#app">Pular para o conteúdo</a>
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="#/">
+          <svg viewBox="0 0 32 32" aria-hidden="true">
+            <circle cx="12" cy="12" r="6" fill="#eda100" />
+            <path d="M10 26h14a5 5 0 0 0 0-10 7 7 0 0 0-13.4 2.2A4 4 0 0 0 10 26z" fill="#2a78d6" />
+          </svg>
+          Clima das Capitais
+        </a>
+        <nav class="nav" aria-label="Seções">
+          <a href="#/" data-route="overview">Visão geral</a>
+          <a href="#/comparar" data-route="compare">Comparar</a>
+          <a href="#/sobre" data-route="about">Sobre os dados</a>
+        </nav>
+        <button id="theme-toggle" class="theme-toggle" type="button">Tema: automático</button>
+      </div>
+    </header>
+    <main id="app" tabindex="-1">
+      <p class="muted">Carregando dados…</p>
+    </main>
+    <footer class="site-footer">
+      <p>
+        Dados meteorológicos e de qualidade do ar:
+        <a href="https://openweathermap.org/" rel="noopener">OpenWeather</a> (plano Free), coletados a cada 3 minutos e
+        consolidados por hora. Horários exibidos no fuso de cada capital.
+      </p>
+      <noscript>Este painel precisa de JavaScript para exibir os gráficos.</noscript>
+    </footer>
+  </body>
+</html>
