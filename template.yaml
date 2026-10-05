@@ -9,7 +9,7 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: {default: Pipeline}
-        Parameters: [Environment, EnableSchedules, CurrentWeatherScheduleExpression, EnableAirPollution, OpenWeatherApiKeyParameterName]
+        Parameters: [Environment, EnableSchedules, CurrentWeatherIntervalMinutes, EnableAirPollution, OpenWeatherApiKeyParameterName]
       - Label: {default: Cost controls}
         Parameters: [MonthlyOperationalCallLimit, RawDataRetentionDays, LogRetentionDays, MonthlyBudgetAmount, BudgetAlertEmail]
       - Label: {default: Consumption}
@@ -44,10 +44,11 @@ Parameters:
     MinValue: 1
     MaxValue: 500000
     Description: Enforced by the Planner. 50 percent of the documented 1,000,000 calls/month Free plan limit.
-  CurrentWeatherScheduleExpression:
-    Type: String
-    Default: cron(0/3 * * * ? *)
-    Description: Current Weather cadence. The default (every 3 minutes) keeps the projected total near 445,000 calls in a 31-day month.
+  CurrentWeatherIntervalMinutes:
+    Type: Number
+    Default: 3
+    AllowedValues: [3, 5, 10, 15, 30]
+    Description: Current Weather cadence in minutes. The default (3) keeps the projected total near 445,000 calls in a 31-day month.
   EnableAirPollution:
     Type: String
     Default: "true"
@@ -364,7 +365,7 @@ Resources:
           Type: Schedule
           Properties:
             Enabled: !If [SchedulesEnabled, true, false]
-            Schedule: !Ref CurrentWeatherScheduleExpression
+            Schedule: !Sub "cron(0/${CurrentWeatherIntervalMinutes} * * * ? *)"
             Input: '{"products": ["current_weather"]}'
         ForecastPlan:
           Type: Schedule

@@ -55,3 +55,32 @@ def test_synthetic_data_runs_through_curator_and_publisher(tmp_path) -> None:
     forecast = json.loads((site / "forecast" / "am.json").read_text(encoding="utf-8"))
     assert len(forecast["weather"]["items"]) == 40
     assert len(forecast["air"]["items"]) == 96
+
+
+def test_local_pipeline_collects_with_spacing_and_reprocesses(tmp_path, monkeypatch) -> None:
+    from scripts import local_pipeline
+    from shared.capitals import get_capitals
+    from shared.openweather import SourceError
+    from shared.source_plan import build_collection_jobs
+    from tests.helpers import RESPONSE_BUILDERS
+
+    def fake_fetch(job, api_key, timeout_seconds):
+        if job["state"] == "RJ" and job["product"] == "air_pollution":
+            raise SourceError("openweather returned HTTP 429", retryable=True, status_code=429)
+        return RESPONSE_BUILDERS[job["product"]](str(job["snapshot_at"]))
+
+    sleeps = []
+    monkeypatch.setattr(local_pipeline, "fetch_free_plan_weather", fake_fetch)
+    monkeypatch.setattr(local_pipeline.time, "sleep", sleeps.append)
+    s3 = LocalDirS3({local_pipeline.RAW_BUCKET: tmp_path / "raw", local_pipeline.SITE_BUCKET: tmp_path / "site"})
+    jobs = build_collection_jobs(get_capitals(["SP", "RJ"]), ["current_weather", "air_pollution"], "metric", "pt_br", "2026-07-15T12:03:00Z")
+    stored, failures = local_pipeline.collect(s3, jobs, "key", min_interval=1.1, timeout=5)
+    assert (stored, failures) == (3, 1)
+    assert len(sleeps) == 3 and all(0 < value <= 1.1 for value in sleeps)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["local_pipeline.py", "--skip-fetch", "--raw-dir", str(tmp_path / "raw"), "--site-dir", str(tmp_path / "site")],
+    )
+    assert local_pipeline.main() == 0
+    assert (tmp_path / "site" / "data" / "latest.json").exists()
