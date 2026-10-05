@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -31,6 +30,7 @@ from shared.hourly_table import (
 )
 from shared.observations import extract_air_pollution, extract_air_pollution_forecast, extract_current_weather, extract_forecast
 from shared.parquet_io import PARQUET_CONTENT_TYPE, parquet_to_records
+from shared.raw_reader import latest_by_state, read_hour
 from shared.s3_io import list_keys, object_exists, parallel_map, put_bytes, put_json, read_bytes, read_json
 from shared.serving import (
     SERIES_CACHE_CONTROL,
@@ -43,7 +43,6 @@ from shared.serving import (
     hourly_key,
     merge_daily_rows,
 )
-from shared.storage import find_latest_raw_keys, latest_keys_by_state
 from shared.structured_logging import emit_metrics, log_event
 from shared.time_utils import floor_hour, floor_minute, hour_range, iso_z
 
@@ -91,18 +90,9 @@ class CuratorConfig:
         )
 
 
-def _read_json_objects(s3_client: Any, bucket: str, keys: list[str], max_workers: int) -> list[dict[str, Any]]:
-    bodies = parallel_map(lambda key: read_bytes(s3_client, bucket, key), keys, max_workers)
-    return [json.loads(body.decode("utf-8")) for body in bodies if body is not None]
-
-
 def _read_parquet_objects(s3_client: Any, bucket: str, keys: list[str], max_workers: int) -> list[dict[str, Any]]:
     bodies = parallel_map(lambda key: read_bytes(s3_client, bucket, key), keys, max_workers)
     return [normalize_hourly_record(row) for body in bodies if body is not None for row in parquet_to_records(body)]
-
-
-def _extract_all(objects: list[dict[str, Any]], extractor: Any) -> list[dict[str, Any]]:
-    return [item for source_object in objects if (item := extractor(source_object)) is not None]
 
 
 def curate_hour(s3_client: Any, config: CuratorConfig, hour: datetime, force: bool = False, processed_at: datetime | None = None) -> dict[str, Any]:
@@ -125,12 +115,10 @@ def curate_hour(s3_client: Any, config: CuratorConfig, hour: datetime, force: bo
     }
 
     if force or not object_exists(s3_client, bucket, result["curated_key"]):
-        weather_objects = _read_json_objects(s3_client, bucket, list_keys(s3_client, bucket, build_raw_hour_prefix(hour)), config.max_workers)
-        air_objects = _read_json_objects(s3_client, bucket, list_keys(s3_client, bucket, build_raw_hour_prefix(hour, "air_pollution")), config.max_workers)
-        weather = _extract_all(weather_objects, extract_current_weather)
-        air = _extract_all(air_objects, extract_air_pollution)
+        weather_objects, weather = read_hour(s3_client, bucket, "current_weather", hour, extract_current_weather, config.max_workers)
+        air_objects, air = read_hour(s3_client, bucket, "air_pollution", hour, extract_air_pollution, config.max_workers)
         records = aggregate_hourly(weather, air, processed_at)
-        result.update({"raw_objects": len(weather_objects) + len(air_objects), "samples": len(weather), "air_samples": len(air)})
+        result.update({"raw_objects": weather_objects + air_objects, "samples": len(weather), "air_samples": len(air)})
         if records:
             put_bytes(s3_client, bucket, result["curated_key"], records_to_parquet(records), PARQUET_CONTENT_TYPE)
             result.update({"hourly": "written", "records": len(records), "local_dates": sorted({record["local_date"] for record in records})})
@@ -138,8 +126,7 @@ def curate_hour(s3_client: Any, config: CuratorConfig, hour: datetime, force: bo
             result["hourly"] = "no_data"
 
     if force or not object_exists(s3_client, bucket, result["forecast_key"]):
-        forecast_keys = list(latest_keys_by_state(list_keys(s3_client, bucket, build_raw_hour_prefix(hour, "forecast_5d_3h"))).values())
-        extracts = _extract_all(_read_json_objects(s3_client, bucket, forecast_keys, config.max_workers), extract_forecast)
+        _, extracts = read_hour(s3_client, bucket, "forecast_5d_3h", hour, extract_forecast, config.max_workers)
         forecast_records = build_forecast_records(extracts, processed_at)
         if forecast_records:
             put_bytes(s3_client, bucket, result["forecast_key"], forecast_records_to_parquet(forecast_records), PARQUET_CONTENT_TYPE)
@@ -229,15 +216,8 @@ def publish_daily_series(s3_client: Any, config: CuratorConfig, now: datetime, u
 def publish_forecasts(s3_client: Any, config: CuratorConfig, now: datetime) -> int:
     bucket = config.raw_bucket
     expected = len(BRAZIL_CAPITALS)
-    weather_keys = find_latest_raw_keys(s3_client, bucket, "forecast_5d_3h", now, config.forecast_lookback_hours, expected)
-    air_keys = find_latest_raw_keys(s3_client, bucket, "air_pollution_forecast", now, config.air_forecast_lookback_hours, expected)
-    weather = {
-        item["state"]: item for item in _extract_all(_read_json_objects(s3_client, bucket, list(weather_keys.values()), config.max_workers), extract_forecast)
-    }
-    air = {
-        item["state"]: item
-        for item in _extract_all(_read_json_objects(s3_client, bucket, list(air_keys.values()), config.max_workers), extract_air_pollution_forecast)
-    }
+    weather = latest_by_state(s3_client, bucket, "forecast_5d_3h", now, config.forecast_lookback_hours, extract_forecast, expected)
+    air = latest_by_state(s3_client, bucket, "air_pollution_forecast", now, config.air_forecast_lookback_hours, extract_air_pollution_forecast, expected)
     site = str(config.site_bucket)
 
     def write(capital: Any) -> bool:

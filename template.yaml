@@ -26,7 +26,7 @@ Globals:
         PIPELINE_NAME: !Ref AWS::StackName
         METRICS_NAMESPACE: WeatherDataPipeline
         API_KEY_CACHE_TTL_SECONDS: "300"
-        SOURCE_TIMEOUT_SECONDS: "10"
+        SOURCE_TIMEOUT_SECONDS: "8"
 
 Parameters:
   Environment:
@@ -238,7 +238,7 @@ Resources:
         Name: !Sub "${AWS::StackName}-security-headers"
         SecurityHeadersConfig:
           ContentSecurityPolicy:
-            ContentSecurityPolicy: "default-src 'self'; img-src 'self' data: https://openweathermap.org; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'"
+            ContentSecurityPolicy: "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'"
             Override: true
           ContentTypeOptions:
             Override: true
@@ -317,10 +317,21 @@ Resources:
       ContentBasedDeduplication: false
       QueueName: !Sub "${AWS::StackName}-source.fifo"
       # AWS recommends at least six times the consumer timeout for SQS event sources.
-      VisibilityTimeout: 360
+      VisibilityTimeout: 1800
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
         maxReceiveCount: 3
+
+  # Month-to-date OpenWeather calls planned by the Planner. Standard String parameters are free, unlike
+  # CloudWatch GetMetricData, so the monthly limit costs nothing to enforce.
+  CallCounterParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/openweather-call-counter"
+      Type: String
+      Tier: Standard
+      Value: '{"month":"","calls":0}'
+      Description: Month-to-date OpenWeather calls (updated by the Planner, read by the Publisher).
 
   AnalyticsLayer:
     Type: AWS::Serverless::LayerVersion
@@ -348,7 +359,7 @@ Resources:
           OPENWEATHER_LANG: pt_br
           OPENWEATHER_PRODUCTS: current_weather
           MONTHLY_OPERATIONAL_CALL_LIMIT: !Ref MonthlyOperationalCallLimit
-          CALL_BUDGET_ENFORCED: "true"
+          CALL_COUNTER_PARAMETER_NAME: !Ref CallCounterParameter
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -358,8 +369,9 @@ Resources:
               Resource: !GetAtt CollectionQueue.Arn
             - Effect: Allow
               Action:
-                - cloudwatch:GetMetricData
-              Resource: "*"
+                - ssm:GetParameter
+                - ssm:PutParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CallCounterParameter}"
       Events:
         CurrentWeatherPlan:
           Type: Schedule
@@ -391,7 +403,10 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: collector.handler.lambda_handler
-      Description: Calls the OpenWeather Free plan APIs and stores raw JSON snapshots.
+      Description: Collects one product snapshot for every capital (paced under 60 calls/minute) and stores it as a single raw object.
+      # I/O bound: 128 MB keeps ~16k batches/month well inside the Lambda free tier.
+      MemorySize: 128
+      Timeout: 300
       Environment:
         Variables:
           RAW_DATA_BUCKET_NAME: !Ref RawDataBucket
@@ -415,11 +430,12 @@ Resources:
           Type: SQS
           Properties:
             Queue: !GetAtt CollectionQueue.Arn
-            BatchSize: 5
+            # Each message is a whole snapshot (27 capitals, ~30 s with 1.1 s between calls).
+            BatchSize: 1
             FunctionResponseTypes:
               - ReportBatchItemFailures
             ScalingConfig:
-              # Keeps bursts well under the 60 calls/minute Free plan limit.
+              # At most two snapshots in flight, which the schedule offsets keep under 60 calls/minute.
               MaximumConcurrency: 2
 
   CuratorFunction:
@@ -483,6 +499,7 @@ Resources:
           SITE_BUCKET_NAME: !Ref SiteBucket
           LATEST_LOOKBACK_HOURS: "3"
           MONTHLY_OPERATIONAL_CALL_LIMIT: !Ref MonthlyOperationalCallLimit
+          CALL_COUNTER_PARAMETER_NAME: !Ref CallCounterParameter
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -503,8 +520,8 @@ Resources:
               Resource: !Sub "arn:${AWS::Partition}:s3:::${SiteBucket}/data/*"
             - Effect: Allow
               Action:
-                - cloudwatch:GetMetricData
-              Resource: "*"
+                - ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CallCounterParameter}"
       Events:
         LatestPublishPlan:
           Type: Schedule
@@ -750,7 +767,8 @@ Resources:
                 ["WeatherDataPipeline", "OpenWeatherApiCalls", "Pipeline", "${AWS::StackName}"],
                 [".", "SourceJobsCollected", ".", "."],
                 [".", "SourceJobFailures", ".", "."],
-                [".", "SourceJobsRejected", ".", "."]
+                [".", "SourceJobsRejected", ".", "."],
+                [".", "SourceJobsExpired", ".", "."]
               ]}},
             {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
               "title": "OpenWeather calls this month (limit ${MonthlyOperationalCallLimit})", "region": "${AWS::Region}", "stat": "Sum", "period": 2592000, "view": "singleValue",

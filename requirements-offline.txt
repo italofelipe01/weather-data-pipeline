@@ -1,0 +1,4 @@
+# Runtime dependencies of the offline service (scripts/offline_service.py) and local queries.
+boto3
+pyarrow>=21
+duckdb>=1.1

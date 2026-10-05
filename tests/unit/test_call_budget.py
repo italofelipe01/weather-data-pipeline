@@ -1,74 +1,73 @@
+import json
 from datetime import UTC, datetime
 
-import pytest
+from botocore.exceptions import ClientError
 
-from shared import call_budget
-
-
-class FakeCloudWatch:
-    def __init__(self, pages: list[list[float]]) -> None:
-        self.pages = pages
-        self.calls = []
-
-    def get_metric_data(self, **kwargs):
-        self.calls.append(kwargs)
-        index = len(self.calls) - 1
-        response = {"MetricDataResults": [{"Id": "calls", "Values": self.pages[index]}]}
-        if index + 1 < len(self.pages):
-            response["NextToken"] = str(index + 1)
-        return response
+from shared.call_budget import FileCallCounter, SsmCallCounter, budget_status
 
 
-@pytest.fixture(autouse=True)
-def _reset_cache():
-    call_budget.reset_cache()
-    yield
-    call_budget.reset_cache()
+class FakeSsm:
+    def __init__(self, value: str | None = None) -> None:
+        self.value = value
+        self.puts = []
+
+    def get_parameter(self, **kwargs):
+        if self.value is None:
+            raise ClientError({"Error": {"Code": "ParameterNotFound"}}, "GetParameter")
+        return {"Parameter": {"Value": self.value}}
+
+    def put_parameter(self, **kwargs):
+        self.puts.append(kwargs)
+        self.value = kwargs["Value"]
 
 
-def test_query_sums_all_pages_from_month_start() -> None:
-    fake = FakeCloudWatch([[1000.0, 2000.0], [500.0]])
-    now = datetime(2026, 6, 25, 12, tzinfo=UTC)
-    assert call_budget.query_month_to_date_calls(fake, "pipeline", now) == 3500
-    query = fake.calls[0]
-    assert query["StartTime"] == datetime(2026, 6, 1, tzinfo=UTC)
-    stat = query["MetricDataQueries"][0]["MetricStat"]
-    assert stat["Metric"]["MetricName"] == "OpenWeatherApiCalls"
-    assert stat["Metric"]["Dimensions"] == [{"Name": "Pipeline", "Value": "pipeline"}]
-    assert fake.calls[1]["NextToken"] == "1"
-
-
-def test_budget_status_is_cached_and_tracks_planned_calls() -> None:
-    fake = FakeCloudWatch([[100_000.0]])
-    now = datetime(2026, 6, 11, tzinfo=UTC)
-    status = call_budget.get_budget_status(fake, now, limit=500_000, pipeline="p", cache_seconds=300)
-    assert status.used == 100_000
+def test_budget_status_projects_the_month() -> None:
+    status = budget_status(100_000, 500_000, datetime(2026, 6, 11, tzinfo=UTC))
     assert status.projected == 300_000
     assert status.allows(400_000) is True
     assert status.allows(400_001) is False
-    call_budget.record_planned_calls(27)
-    again = call_budget.get_budget_status(fake, now, limit=500_000, pipeline="p", cache_seconds=300)
-    assert again.used == 100_027
-    assert len(fake.calls) == 1
-    summary = again.as_dict()
-    assert summary["remaining"] == 399_973
+    summary = status.as_dict()
+    assert summary["remaining"] == 400_000
     assert summary["month"] == "2026-06"
+    assert summary["usage_ratio"] == 0.2
 
 
-class SequenceCloudWatch:
-    def __init__(self, totals: list[float]) -> None:
-        self.totals = totals
-        self.calls = []
+def test_ssm_counter_accumulates_and_resets_each_month() -> None:
+    ssm = FakeSsm()
+    counter = SsmCallCounter(ssm, "/stack/openweather-call-counter")
+    june = datetime(2026, 6, 30, 23, tzinfo=UTC)
+    assert counter.read(june) == 0
+    assert counter.add(june, 27) == 27
+    assert counter.add(june, 27) == 54
+    assert ssm.puts[-1]["Type"] == "String" and ssm.puts[-1]["Overwrite"] is True
+    assert json.loads(ssm.value) == {"month": "2026-06", "calls": 54}
+    july = datetime(2026, 7, 1, 0, 3, tzinfo=UTC)
+    assert counter.read(july) == 0
+    assert counter.add(july, 27) == 27
 
-    def get_metric_data(self, **kwargs):
-        self.calls.append(kwargs)
-        return {"MetricDataResults": [{"Values": [self.totals[len(self.calls) - 1]]}]}
+
+def test_ssm_counter_tolerates_initial_or_corrupt_values() -> None:
+    assert SsmCallCounter(FakeSsm('{"month":"","calls":0}'), "/p").read(datetime(2026, 6, 1, tzinfo=UTC)) == 0
+    assert SsmCallCounter(FakeSsm("not json"), "/p").read(datetime(2026, 6, 1, tzinfo=UTC)) == 0
 
 
-def test_month_change_invalidates_cache() -> None:
-    fake = SequenceCloudWatch([10.0, 0.0])
-    call_budget.get_budget_status(fake, datetime(2026, 6, 30, 23, tzinfo=UTC), limit=10, pipeline="p", cache_seconds=300)
-    status = call_budget.get_budget_status(fake, datetime(2026, 7, 1, 0, 5, tzinfo=UTC), limit=10, pipeline="p", cache_seconds=300)
-    assert status.used == 0
-    assert status.allows(10) is True
-    assert len(fake.calls) == 2
+def test_ssm_counter_propagates_other_errors() -> None:
+    class Denied(FakeSsm):
+        def get_parameter(self, **kwargs):
+            raise ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetParameter")
+
+    try:
+        SsmCallCounter(Denied(), "/p").read(datetime(2026, 6, 1, tzinfo=UTC))
+    except ClientError:
+        pass
+    else:
+        raise AssertionError("expected ClientError")
+
+
+def test_file_counter(tmp_path) -> None:
+    counter = FileCallCounter(tmp_path / "state" / "calls.json")
+    now = datetime(2026, 6, 10, tzinfo=UTC)
+    assert counter.read(now) == 0
+    counter.add(now, 108)
+    assert FileCallCounter(tmp_path / "state" / "calls.json").read(now) == 108
+    assert counter.read(datetime(2026, 7, 1, tzinfo=UTC)) == 0

@@ -26,10 +26,10 @@ os.environ.setdefault("METRICS_DISABLED", "true")
 from curator.handler import CuratorConfig, run  # noqa: E402
 from publisher.handler import PublisherConfig, publish_latest  # noqa: E402
 from scripts.local_s3 import LocalDirS3  # noqa: E402
-from shared.capitals import BRAZIL_CAPITALS, Capital  # noqa: E402
+from shared.capitals import BRAZIL_CAPITALS, Capital, capital_by_state  # noqa: E402
+from shared.collection import build_batch_job, build_batch_key, collect_batch  # noqa: E402
 from shared.daily_table import build_curated_daily_key, daily_records_to_parquet  # noqa: E402
-from shared.source_plan import build_collection_jobs  # noqa: E402
-from shared.storage import build_source_key, build_source_object, put_json_once  # noqa: E402
+from shared.storage import put_json_once  # noqa: E402
 from shared.time_utils import floor_hour, iso_z  # noqa: E402
 
 RAW_BUCKET = "local-raw"
@@ -231,10 +231,16 @@ BUILDERS = {
 
 
 def _store(s3: LocalDirS3, product: str, moment: datetime) -> int:
-    jobs = build_collection_jobs(BRAZIL_CAPITALS, [product], "metric", "pt_br", iso_z(moment))
-    for job, capital in zip(jobs, BRAZIL_CAPITALS, strict=True):
-        put_json_once(s3, RAW_BUCKET, build_source_key(job), build_source_object(job, BUILDERS[product](capital, moment)))
-    return len(jobs)
+    """Run the real batch collector with a synthetic fetch and store one raw object for the snapshot."""
+    batch_job = build_batch_job(product, BRAZIL_CAPITALS, "metric", "pt_br", iso_z(moment))
+
+    def fetch(job: dict[str, Any]) -> dict[str, Any]:
+        return BUILDERS[product](capital_by_state(str(job["state"])), moment)
+
+    result = collect_batch(batch_job, fetch)
+    key = build_batch_key(product, result.snapshot_at, [capital["state"] for capital in BRAZIL_CAPITALS])
+    put_json_once(s3, RAW_BUCKET, key, result.raw_object())
+    return len(result.items)
 
 
 def generate_raw(s3: LocalDirS3, now: datetime, hours: int) -> int:
@@ -323,7 +329,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Gera dados sinteticos e executa Curator/Publisher locais para pre-visualizar o dashboard.")
     parser.add_argument("--hours", type=int, default=36, help="Horas de snapshots raw sinteticos (padrao: 36)")
     parser.add_argument("--history-days", type=int, default=400, help="Dias de historico diario sintetico (padrao: 400)")
-    parser.add_argument("--raw-dir", default=".local-data/raw", help="Diretorio do bucket raw local")
+    parser.add_argument("--raw-dir", default=".local-data/lake", help="Diretorio do data lake local (raw/ e curated/)")
     parser.add_argument("--site-dir", default="frontend", help="Diretorio do site (os JSON vao para <site-dir>/data)")
     parser.add_argument("--now", default="", help="Instante de referencia ISO-8601 (padrao: agora)")
     args = parser.parse_args()
@@ -335,7 +341,7 @@ def main() -> int:
     history = generate_daily_history(s3, raw_start - timedelta(days=args.history_days), raw_start - timedelta(days=1)) if args.history_days else 0
     config = CuratorConfig(raw_bucket=RAW_BUCKET, site_bucket=SITE_BUCKET, lookback_hours=args.hours)
     curation = run({"rebuild_serving": True}, s3, config, now)
-    latest = publish_latest(s3, PublisherConfig(raw_bucket=RAW_BUCKET, site_bucket=SITE_BUCKET), now)
+    latest = publish_latest(s3, PublisherConfig(raw_bucket=RAW_BUCKET, site_bucket=SITE_BUCKET, runtime="local"), now)
     print(
         json.dumps(
             {

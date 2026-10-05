@@ -70,10 +70,6 @@ export function capitalize(text) {
   return text.charAt(0).toLocaleUpperCase("pt-BR") + text.slice(1);
 }
 
-export function iconUrl(icon) {
-  return /^\d{2}[dn]$/.test(icon || "") ? `https://openweathermap.org/img/wn/${icon}@2x.png` : null;
-}
-
 const dateFormats = new Map();
 
 function dateFormat(timeZone, options) {

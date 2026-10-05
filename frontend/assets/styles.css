@@ -31,6 +31,10 @@
   --status-serious-text: #9c3d17;
   --status-critical-text: #a32626;
   --shadow: 0 1px 2px rgba(11, 11, 11, 0.05);
+  --icon-sun: #eda100;
+  --icon-moon: #898781;
+  --icon-cloud: #c3c2b7;
+  --icon-cloud-dark: #898781;
   --radius: 12px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -60,6 +64,10 @@
     --status-serious-text: #ec835a;
     --status-critical-text: #e66767;
     --shadow: none;
+    --icon-sun: #fab219;
+    --icon-moon: #e1e0d9;
+    --icon-cloud: #c3c2b7;
+    --icon-cloud-dark: #898781;
   }
 }
 
@@ -87,6 +95,10 @@
   --status-serious-text: #ec835a;
   --status-critical-text: #e66767;
   --shadow: none;
+  --icon-sun: #fab219;
+  --icon-moon: #e1e0d9;
+  --icon-cloud: #c3c2b7;
+  --icon-cloud-dark: #898781;
 }
 
 *,
@@ -450,6 +462,46 @@ a.tile:hover {
   width: 64px;
   height: 64px;
   flex: none;
+}
+
+.wx-sun circle,
+.wx-bolt {
+  fill: var(--icon-sun);
+}
+
+.wx-sun line {
+  stroke: var(--icon-sun);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+.wx-moon {
+  fill: var(--icon-moon);
+}
+
+.wx-cloud {
+  fill: var(--icon-cloud);
+}
+
+.wx-cloud-dark {
+  fill: var(--icon-cloud-dark);
+}
+
+.wx-rain line,
+.wx-snow line {
+  stroke: var(--series-1);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+.wx-mist line {
+  stroke: var(--icon-cloud-dark);
+  stroke-width: 4;
+  stroke-linecap: round;
+}
+
+.wx-unknown {
+  fill: var(--surface-3);
 }
 
 .weather-icon.small {

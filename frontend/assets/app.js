@@ -1,4 +1,5 @@
 import { barChart, columnChart, legend, lineChart, tableView } from "./charts.js";
+import { weatherIconSvg } from "./icons.js";
 import {
   REGIONS,
   aggregateDaily,
@@ -32,7 +33,6 @@ import {
   fmtVisibility,
   fmtWeekday,
   fmtWind,
-  iconUrl,
   isNumber,
   toKmh,
 } from "./format.js";
@@ -124,12 +124,7 @@ function tile(label, value, detail = null, href = null) {
 }
 
 function weatherIcon(icon, description, size = "") {
-  const url = iconUrl(icon);
-  const fallback = () => h("span", { class: "icon-fallback", "aria-hidden": "true", text: "?" });
-  if (!url) return fallback();
-  const image = h("img", { class: `weather-icon ${size}`.trim(), src: url, alt: description || "", width: 64, height: 64, loading: "lazy", decoding: "async" });
-  image.addEventListener("error", () => image.replaceWith(fallback()), { once: true });
-  return image;
+  return weatherIconSvg(icon, capitalize(description), `weather-icon ${size}`.trim());
 }
 
 function aqiBadge(aqi, withIndex = true) {
@@ -1091,16 +1086,16 @@ async function aboutView() {
             )
           : h("p", { class: "muted", text: "O consumo mensal aparece quando o painel roda na AWS (métrica OpenWeatherApiCalls)." }),
         h("p", { class: "subtle", text: `Capitais com observação: ${latest ? latest.capitals.filter((c) => c.current).length : 0} de 27.` }),
+        h("p", { class: "subtle", text: latest?.runtime === "local" ? "Executando no modo offline (nesta máquina, sem nuvem)." : "Executando na AWS." }),
       ),
       card(
         "Fluxo",
-        "Tudo serverless, sem intervenção manual depois do deploy",
+        "O mesmo código roda na AWS (serverless) ou offline, nesta máquina",
         h(
           "ol",
           { class: "steps" },
-          h("li", { text: "EventBridge agenda o Planner, que cria um job por capital e produto e respeita o teto mensal." }),
-          h("li", { text: "A fila SQS FIFO entrega os jobs ao Collector, limitado a 2 execuções simultâneas (abaixo de 60 chamadas/min)." }),
-          h("li", { text: "O Collector chama a OpenWeather e grava o JSON bruto no S3 (expira em 30 dias)." }),
+          h("li", { text: "O agendador dispara o Planner, que cria uma coleta por produto e respeita o teto mensal de chamadas." }),
+          h("li", { text: "O Collector consulta as 27 capitais em sequência (uma chamada a cada 1,1 s, abaixo de 60/min) e grava um único JSON bruto por coleta (expira em 30 dias)." }),
           h("li", { text: "O Curator, a cada hora, gera tabelas Parquet horária, diária e de previsão, recupera horas perdidas e publica as séries deste painel." }),
           h("li", { text: "O Publisher, a cada 10 minutos, publica a observação mais recente de cada capital." }),
         ),

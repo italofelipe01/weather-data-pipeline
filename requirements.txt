@@ -6,3 +6,4 @@ pytest
 pytest-cov
 pyarrow
 ruff
+duckdb>=1.1

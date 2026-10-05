@@ -36,4 +36,4 @@ Todos os documentos tem `schema_version` e `generated_at`. Os nomes de campos se
 ./scripts/run-local-pipeline.ps1 -States SP -Serve  # API real
 ```
 
-Os icones de condicao vem de `openweathermap.org/img/wn/` (sem chave). A Content Security Policy do CloudFront libera apenas esse dominio para imagens.
+Os icones de condicao sao SVG desenhados localmente (`frontend/assets/icons.js`): o site nao faz nenhuma requisicao externa e funciona offline.

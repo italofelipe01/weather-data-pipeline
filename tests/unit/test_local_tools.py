@@ -57,30 +57,17 @@ def test_synthetic_data_runs_through_curator_and_publisher(tmp_path) -> None:
     assert len(forecast["air"]["items"]) == 96
 
 
-def test_local_pipeline_collects_with_spacing_and_reprocesses(tmp_path, monkeypatch) -> None:
-    from scripts import local_pipeline
-    from shared.capitals import get_capitals
-    from shared.openweather import SourceError
-    from shared.source_plan import build_collection_jobs
-    from tests.helpers import RESPONSE_BUILDERS
+def test_query_local_runs_athena_sql_on_local_parquet(tmp_path, capsys) -> None:
+    from scripts import query_local
 
-    def fake_fetch(job, api_key, timeout_seconds):
-        if job["state"] == "RJ" and job["product"] == "air_pollution":
-            raise SourceError("openweather returned HTTP 429", retryable=True, status_code=429)
-        return RESPONSE_BUILDERS[job["product"]](str(job["snapshot_at"]))
-
-    sleeps = []
-    monkeypatch.setattr(local_pipeline, "fetch_free_plan_weather", fake_fetch)
-    monkeypatch.setattr(local_pipeline.time, "sleep", sleeps.append)
-    s3 = LocalDirS3({local_pipeline.RAW_BUCKET: tmp_path / "raw", local_pipeline.SITE_BUCKET: tmp_path / "site"})
-    jobs = build_collection_jobs(get_capitals(["SP", "RJ"]), ["current_weather", "air_pollution"], "metric", "pt_br", "2026-07-15T12:03:00Z")
-    stored, failures = local_pipeline.collect(s3, jobs, "key", min_interval=1.1, timeout=5)
-    assert (stored, failures) == (3, 1)
-    assert len(sleeps) == 3 and all(0 < value <= 1.1 for value in sleeps)
-
-    monkeypatch.setattr(
-        "sys.argv",
-        ["local_pipeline.py", "--skip-fetch", "--raw-dir", str(tmp_path / "raw"), "--site-dir", str(tmp_path / "site")],
-    )
-    assert local_pipeline.main() == 0
-    assert (tmp_path / "site" / "data" / "latest.json").exists()
+    lake = tmp_path / "lake"
+    s3 = LocalDirS3({sample_data.RAW_BUCKET: lake, sample_data.SITE_BUCKET: tmp_path / "site"})
+    sample_data.generate_daily_history(s3, date(2026, 7, 1), date(2026, 7, 3))
+    output = tmp_path / "monthly.csv"
+    assert query_local.main(["queries/monthly_from_daily.sql", "--lake-dir", str(lake), "--output", str(output)]) == 0
+    lines = output.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("year,month,state,city,monthly_temperature_avg")
+    assert len(lines) == 28
+    assert query_local.main(["--sql", "SELECT count(*) AS n FROM weather_daily_observations", "--lake-dir", str(lake)]) == 0
+    assert "81" in capsys.readouterr().out
+    assert query_local.main(["--sql", "SELECT 1", "--lake-dir", str(tmp_path / "empty")]) == 2

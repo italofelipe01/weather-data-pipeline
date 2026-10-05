@@ -204,3 +204,22 @@ def store_raw(s3: MemoryS3, bucket: str, state: str, product: str, snapshot_at: 
 
 def utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def store_batch(
+    s3: MemoryS3,
+    bucket: str,
+    product: str,
+    snapshot_at: str,
+    states: tuple[str, ...] = ("SP", "RJ"),
+    responses: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Store one batch raw object, exactly as the Collector writes it."""
+    from shared.capitals import get_capitals
+    from shared.collection import build_batch_job, build_batch_key, collect_batch
+
+    batch_job = build_batch_job(product, get_capitals(list(states)), "metric", "pt_br", snapshot_at)
+    result = collect_batch(batch_job, lambda job: (responses or {}).get(job["state"]) or RESPONSE_BUILDERS[product](snapshot_at))
+    key = build_batch_key(product, snapshot_at, states)
+    s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(result.raw_object()).encode("utf-8"))
+    return key

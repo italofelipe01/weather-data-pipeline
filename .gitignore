@@ -13,3 +13,4 @@ dist/
 *.egg-info/
 .local-data/
 frontend/data/
+.localstack/

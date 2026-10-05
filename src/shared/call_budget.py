@@ -1,18 +1,24 @@
+"""Month-to-date OpenWeather call counter used to enforce MonthlyOperationalCallLimit.
+
+The Planner adds the calls it schedules; the Publisher reads the value for the dashboard. Two free backends:
+an SSM standard String parameter (cloud) and a JSON file (offline). CloudWatch GetMetricData is not used
+because it is billed per metric requested and has no free allowance.
+"""
+
 from __future__ import annotations
 
 import calendar
+import json
 import os
-import time
+import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Protocol
 
-from shared.structured_logging import DEFAULT_NAMESPACE
+from botocore.exceptions import ClientError
+
 from shared.time_utils import month_start, parse_utc
-
-API_CALLS_METRIC = "OpenWeatherApiCalls"
-
-_cache: dict[str, Any] = {"month": None, "value": None, "until": 0.0, "added": 0}
 
 
 @dataclass(frozen=True)
@@ -40,62 +46,74 @@ class BudgetStatus:
         }
 
 
-def reset_cache() -> None:
-    _cache.update({"month": None, "value": None, "until": 0.0, "added": 0})
+def month_key(now: datetime) -> str:
+    return f"{parse_utc(now):%Y-%m}"
 
 
-def query_month_to_date_calls(cloudwatch_client: Any, pipeline: str, now: datetime, namespace: str = DEFAULT_NAMESPACE) -> int:
-    start = month_start(now)
-    total = 0.0
-    next_token: str | None = None
-    while True:
-        kwargs: dict[str, Any] = {
-            "MetricDataQueries": [
-                {
-                    "Id": "calls",
-                    "MetricStat": {
-                        "Metric": {
-                            "Namespace": namespace,
-                            "MetricName": API_CALLS_METRIC,
-                            "Dimensions": [{"Name": "Pipeline", "Value": pipeline}],
-                        },
-                        "Period": 86400,
-                        "Stat": "Sum",
-                    },
-                    "ReturnData": True,
-                }
-            ],
-            "StartTime": start,
-            "EndTime": parse_utc(now) + timedelta(minutes=1),
-        }
-        if next_token:
-            kwargs["NextToken"] = next_token
-        response = cloudwatch_client.get_metric_data(**kwargs)
-        for result in response.get("MetricDataResults", []):
-            total += sum(float(value) for value in result.get("Values", []))
-        next_token = response.get("NextToken")
-        if not next_token:
-            return int(total)
-
-
-def get_budget_status(cloudwatch_client: Any, now: datetime, limit: int, pipeline: str | None = None, cache_seconds: int | None = None) -> BudgetStatus:
-    """Month-to-date OpenWeather calls (from the Collector EMF metric), cached briefly per Lambda container."""
+def budget_status(used: int, limit: int, now: datetime) -> BudgetStatus:
     now = parse_utc(now)
-    pipeline = pipeline or os.getenv("PIPELINE_NAME", "local")
-    namespace = os.getenv("METRICS_NAMESPACE", DEFAULT_NAMESPACE)
-    ttl = int(os.getenv("CALL_BUDGET_CACHE_SECONDS", "300")) if cache_seconds is None else cache_seconds
-    month = f"{now:%Y-%m}"
-    if _cache["month"] != month or _cache["value"] is None or time.monotonic() >= _cache["until"]:
-        _cache.update(
-            {"month": month, "value": query_month_to_date_calls(cloudwatch_client, pipeline, now, namespace), "until": time.monotonic() + ttl, "added": 0}
-        )
-    used = int(_cache["value"]) + int(_cache["added"])
     days_in_month = calendar.monthrange(now.year, now.month)[1]
     elapsed_days = max((now - month_start(now)).total_seconds() / 86400, 1 / 24)
-    projected = int(used / elapsed_days * days_in_month)
-    return BudgetStatus(month=month, used=used, limit=limit, projected=projected)
+    return BudgetStatus(month=month_key(now), used=used, limit=limit, projected=int(used / elapsed_days * days_in_month))
 
 
-def record_planned_calls(count: int) -> None:
-    """Account calls enqueued since the last CloudWatch read, so the cached value stays conservative."""
-    _cache["added"] = int(_cache["added"]) + count
+class CallCounter(Protocol):
+    def read(self, now: datetime) -> int: ...
+
+    def add(self, now: datetime, calls: int) -> int: ...
+
+
+def _decode(value: str | None, now: datetime) -> int:
+    try:
+        document = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(document, dict) or document.get("month") != month_key(now):
+        return 0  # a new month starts from zero
+    return int(document.get("calls") or 0)
+
+
+def _encode(now: datetime, calls: int) -> str:
+    return json.dumps({"month": month_key(now), "calls": calls}, separators=(",", ":"))
+
+
+class SsmCallCounter:
+    """Standard-tier String parameter: no storage or API charge. Read-modify-write; the rare race between two
+    Planner runs can only undercount a few calls, which the 50% safety margin absorbs."""
+
+    def __init__(self, ssm_client: Any, parameter_name: str) -> None:
+        self.ssm_client = ssm_client
+        self.parameter_name = parameter_name
+
+    def read(self, now: datetime) -> int:
+        try:
+            response = self.ssm_client.get_parameter(Name=self.parameter_name)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ParameterNotFound":
+                return 0
+            raise
+        return _decode(response.get("Parameter", {}).get("Value"), now)
+
+    def add(self, now: datetime, calls: int) -> int:
+        total = self.read(now) + calls
+        self.ssm_client.put_parameter(Name=self.parameter_name, Value=_encode(now, total), Type="String", Overwrite=True)
+        return total
+
+
+class FileCallCounter:
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def read(self, now: datetime) -> int:
+        try:
+            return _decode(self.path.read_text(encoding="utf-8"), now)
+        except FileNotFoundError:
+            return 0
+
+    def add(self, now: datetime, calls: int) -> int:
+        total = self.read(now) + calls
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent, delete=False, suffix=".tmp") as handle:
+            handle.write(_encode(now, total))
+        os.replace(handle.name, self.path)
+        return total
