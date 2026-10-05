@@ -33,3 +33,9 @@ def test_summarize_forecast() -> None:
     summary = summarize("forecast_5d_3h", {"list": [{"dt_txt": "2026-06-25 12:00:00", "main": {"temp": 20.0}}]})
     assert "forecast_records=1" in summary
     assert "first_temp=20.0C" in summary
+
+
+def test_summarize_air_pollution() -> None:
+    summary = summarize("air_pollution", {"list": [{"main": {"aqi": 2}, "components": {"pm2_5": 7.5, "pm10": 11.0}}]})
+    assert "aqi=2" in summary
+    assert "pm2_5=7.5ug/m3" in summary

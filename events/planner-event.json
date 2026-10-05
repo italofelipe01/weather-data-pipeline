@@ -1,7 +1,6 @@
 {
   "states": ["SP", "RJ"],
-  "products": ["current_weather", "forecast_5d_3h"],
-  "snapshot_at": "2026-06-25T12:00:00Z",
+  "products": ["current_weather", "forecast_5d_3h", "air_pollution", "air_pollution_forecast"],
   "units": "metric",
   "lang": "pt_br"
 }

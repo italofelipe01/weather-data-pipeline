@@ -42,6 +42,9 @@ def summarize(product: str, payload: dict[str, Any]) -> str:
     records = payload.get("list", [])
     first = records[0] if records else {}
     main = first.get("main", {})
+    if product in {"air_pollution", "air_pollution_forecast"}:
+        components = first.get("components", {})
+        return f"records={len(records)} aqi={main.get('aqi')} pm2_5={components.get('pm2_5')}ug/m3 pm10={components.get('pm10')}ug/m3"
     return f"forecast_records={len(records)} first_dt={first.get('dt_txt')} first_temp={main.get('temp')}C"
 
 
@@ -50,7 +53,11 @@ def main() -> int:
     parser.add_argument("--env-file", default=".env", help="Arquivo local com OPENWEATHER_API_KEY. Padrao: .env")
     parser.add_argument("--api-key", default="", help="Opcional. Prefira .env para nao deixar a chave no historico do terminal.")
     parser.add_argument("--states", default="SP", help="UFs separadas por virgula. Exemplo: SP,RJ")
-    parser.add_argument("--products", default="current_weather", help="current_weather, forecast_5d_3h ou ambos separados por virgula")
+    parser.add_argument(
+        "--products",
+        default="current_weather",
+        help="current_weather, forecast_5d_3h, air_pollution, air_pollution_forecast ou all (separados por virgula)",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=30)
     args = parser.parse_args()
 
