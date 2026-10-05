@@ -4,17 +4,25 @@
 
 Lambda atende melhor a uma coleta orientada a eventos, com custo quase zero quando o pipeline esta parado. Airflow seria mais pesado para esta etapa.
 
-## SQS FIFO com concorrencia limitada
+## SQS FIFO com uma mensagem por coleta
 
-A fila desacopla planejamento e coleta e deduplica jobs iguais (inclusive invocacoes duplicadas do EventBridge). `ScalingConfig.MaximumConcurrency=2` mantem as rajadas abaixo de 60 chamadas/minuto, e o visibility timeout e 6x o timeout da Collector, como a AWS recomenda.
+A fila desacopla planejamento e coleta e deduplica coletas iguais (inclusive invocacoes duplicadas do EventBridge). Cada mensagem e uma coleta inteira (um produto, 27 capitais); a Collector espaca as chamadas em 1,1 s e `ScalingConfig.MaximumConcurrency=2` limita a duas coletas simultaneas, o que mantem qualquer janela de 60 s abaixo do limite do plano Free. O visibility timeout e 6x o timeout da Collector, como a AWS recomenda.
+
+## Um objeto por coleta, nao por capital
+
+A primeira versao gravava um JSON por capital: ~445 mil PUTs/mes, o maior custo do projeto (~US$ 3,10/mes). Agrupar as 27 respostas de uma coleta num unico objeto reduz para ~16,5 mil PUTs/mes e tambem diminui GETs e LISTs da Curator. O leitor (`shared/raw_reader.py`) entende os dois formatos, entao os objetos antigos continuam validos ate expirarem.
+
+## Coletas atrasadas sao descartadas
+
+A OpenWeather sempre devolve o dado *atual*. Uma coleta reprocessada muito depois gravaria o valor de agora com o horario antigo, entao a Collector descarta snapshots acima de uma idade maxima por produto (15 min para a Current Weather) e conta em `SourceJobsExpired`.
 
 ## Somente o plano Free, usando tudo o que ele oferece
 
 Alem de Current Weather e 5 Day / 3 Hour Forecast, o projeto usa a Air Pollution API (atual e previsao), que tambem faz parte do plano Free, e aproveita todos os campos documentados das respostas. One Call, History API e Air Pollution history ficam de fora.
 
-## Teto de 50% aplicado pela Planner
+## Teto de 50% aplicado pela Planner com contador gratuito
 
-O parametro `MonthlyOperationalCallLimit` existia mas nao era aplicado. Agora a Collector publica `OpenWeatherApiCalls` (toda requisicao conta, com ou sem sucesso) e a Planner consulta o total do mes antes de enfileirar. Contadores em DynamoDB ou SSM foram descartados: a metrica ja existe, nao precisa de recurso novo e o atraso de alguns minutos e irrelevante diante da margem de 50%.
+O parametro `MonthlyOperationalCallLimit` existia mas nao era aplicado. A Planner soma as chamadas que agenda num parametro SSM padrao (String, sem custo) e nao agenda coletas que ultrapassariam o teto. A primeira implementacao consultava a metrica do CloudWatch com `GetMetricData`, que e cobrada por metrica consultada; o contador no SSM tem o mesmo efeito por zero. Uma corrida rara entre duas execucoes da Planner pode subcontar algumas chamadas, o que a margem de 50% absorve. A metrica `OpenWeatherApiCalls` continua existindo para o dashboard de operacao (com retries).
 
 ## Metricas EMF direto no stdout
 
@@ -50,6 +58,14 @@ A chave OpenWeather fica em SecureString no SSM. Secrets Manager nao foi usado p
 ## Sem DynamoDB
 
 A idempotencia e resolvida pela deduplicacao da SQS FIFO e pela chave deterministica no S3 com `If-None-Match`.
+
+## Modo offline com o mesmo codigo
+
+O plano Free da AWS fecha a conta apos 6 meses. Para o projeto nao depender da nuvem, o modo offline reutiliza as mesmas funcoes com um agendador local, um S3 em disco e DuckDB no lugar do Athena. Manter um unico codigo evita que os dois modos divirjam; o layout de chaves identico permite migrar dados com `aws s3 sync`.
+
+## Icones locais no dashboard
+
+Os icones de condicao sao SVG gerados no proprio frontend em vez das imagens de `openweathermap.org`: o site nao faz nenhuma requisicao externa, funciona offline e a Content Security Policy fica restrita a `'self'`.
 
 ## pyarrow em layer
 

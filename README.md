@@ -1,10 +1,22 @@
 # Weather Data Pipeline
 
-Pipeline serverless AWS que monta uma serie temporal propria de clima e qualidade do ar das 27 capitais do Brasil usando **somente APIs do plano gratuito da OpenWeather**, com tabelas Parquet consultaveis no Athena e um **dashboard web** publicado no CloudFront.
+Pipeline que monta uma serie temporal propria de clima e qualidade do ar das 27 capitais do Brasil usando **somente APIs do plano gratuito da OpenWeather**, com tabelas Parquet consultaveis (Athena ou DuckDB) e um **dashboard web**.
 
 O projeto nao compra historico passado: ele coleta continuamente observacoes e previsoes e agrega por hora, dia, semana, mes e ano conforme o tempo passa.
 
-## O que roda sozinho depois do deploy
+## Dois modos, o mesmo codigo
+
+| | **AWS (serverless)** | **Offline (sua maquina ou Docker)** |
+|---|---|---|
+| Custo | ~US$ 0,70/mes, coberto pelos creditos do plano Free | US$ 0 de nuvem |
+| Disponibilidade | 24/7 sem depender do seu computador | enquanto a maquina/container estiver ligado |
+| Dashboard | CloudFront (link publico) | `http://localhost:8000` |
+| Consultas | Athena | DuckDB (`scripts/query_local.py`) |
+| Comecar | `./scripts/deploy.ps1 ...` | `./scripts/start-offline.ps1` ou `docker compose up -d` |
+
+Os dois usam o mesmo layout de dados: `./scripts/export-from-aws.ps1` traz tudo da AWS para o modo offline (por exemplo, antes de a conta do plano Free fechar no sexto mes). Detalhes: [`docs/offline.md`](docs/offline.md) e [`docs/cost-controls.md`](docs/cost-controls.md).
+
+## O que roda sozinho (AWS ou offline)
 
 | Quando | Quem | O que faz |
 |---|---|---|
@@ -24,13 +36,13 @@ Nada disso exige intervencao manual. A chave da API pode ser trocada no SSM sem 
 ```mermaid
 flowchart LR
   E[EventBridge] --> P[Lambda Planner]
-  P -- teto mensal --> CW[(CloudWatch metrics)]
-  P --> Q[SQS FIFO]
+  P -- teto mensal --> N[(SSM contador)]
+  P --> Q[SQS FIFO - 1 mensagem por coleta]
   Q --> C[Lambda Collector]
   Q --> D[DLQ]
   K[SSM SecureString] --> C
   C --> O[OpenWeather Free APIs]
-  C --> R[(S3 raw JSON - 30 dias)]
+  C --> R[(S3 raw JSON - 1 objeto por coleta, 30 dias)]
   R --> U[Lambda Curator]
   U --> T[(S3 curated Parquet)]
   T --> G[Glue Catalog + Athena]
@@ -38,7 +50,7 @@ flowchart LR
   R --> B[Lambda Publisher]
   B --> W
   W --> F[CloudFront + dashboard]
-  C --> CW
+  C --> CW[(CloudWatch metricas EMF)]
   CW --> A[Alarmes -> SNS e-mail]
 ```
 
@@ -46,7 +58,7 @@ Detalhes em [`docs/architecture.md`](docs/architecture.md).
 
 ## APIs usadas e teto operacional
 
-Plano Free da OpenWeather: **60 chamadas/minuto e 1.000.000 chamadas/mes**. O projeto usa no maximo **500.000/mes** (50%), e esse teto e aplicado pela Planner com base na metrica `OpenWeatherApiCalls`.
+Plano Free da OpenWeather: **60 chamadas/minuto e 1.000.000 chamadas/mes**. O projeto usa no maximo **500.000/mes** (50%), e esse teto e aplicado pela Planner com um contador mensal gratuito (parametro SSM na AWS, arquivo local no modo offline).
 
 | Produto | Endpoint | Cadencia | Chamadas em 31 dias |
 |---|---|---|---|
@@ -56,13 +68,13 @@ Plano Free da OpenWeather: **60 chamadas/minuto e 1.000.000 chamadas/mes**. O pr
 | Air Pollution forecast | `/data/2.5/air_pollution/forecast` | 6 h | 3.348 |
 | **Total** | | | **445.284** (430.920 em 30 dias) |
 
-Cada agenda dispara 27 chamadas e os horarios foram escolhidos para que no maximo duas agendas caiam na mesma janela de 60 segundos (54 < 60). A Collector roda com no maximo 2 execucoes simultaneas. Geocoding nao e usado: as coordenadas ficam em `src/shared/capitals.py`.
+Cada coleta consulta as 27 capitais em sequencia, uma chamada a cada 1,1 s, e grava **um unico objeto** com as 27 respostas. Os horarios das agendas garantem no maximo duas coletas na mesma janela de 60 segundos (54 < 60). Geocoding nao e usado: as coordenadas ficam em `src/shared/capitals.py`.
 
 Campos aproveitados e limites: [`docs/data-source.md`](docs/data-source.md).
 
 ## Comecando
 
-Requisitos: Python 3.13, PowerShell 7 (ou Windows PowerShell 5.1), e para AWS: AWS CLI, SAM CLI e Docker.
+Requisitos: Python 3.13 e PowerShell 7 (ou Windows PowerShell 5.1). Para AWS: AWS CLI, SAM CLI e Docker. Para o modo offline via container: so Docker.
 
 ```powershell
 python -m venv .venv
@@ -79,15 +91,15 @@ Gera dados sinteticos, passa pelo Curator e pelo Publisher reais e serve o site 
 ./scripts/preview-frontend.ps1
 ```
 
-### 2. Rodar o pipeline local com a API real
+### 2. Rodar offline, com a API real e sem nuvem
 
 ```powershell
 Copy-Item .env.example .env   # preencha OPENWEATHER_API_KEY
-./scripts/test-openweather-local.ps1 -States SP -Products all
-./scripts/run-local-pipeline.ps1 -States SP,RJ,DF -Serve
+./scripts/test-openweather-local.ps1 -States SP -Products all   # teste rapido da chave
+./scripts/start-offline.ps1                                     # pipeline completo + dashboard em http://localhost:8000
 ```
 
-O `run-local-pipeline` coleta respeitando 60 chamadas/minuto, grava o raw em `.local-data/` e publica os JSON do dashboard em `frontend/data/` (ambos no `.gitignore`).
+Ou, para deixar rodando 24/7: `docker compose up -d`. No Windows, `./scripts/install-offline-service.ps1` inicia o servico sozinho ao fazer logon. Os dados ficam em `.local-data/` e `frontend/data/` (ambos no `.gitignore`). Guia completo: [`docs/offline.md`](docs/offline.md).
 
 ### 3. Deploy na AWS (um comando)
 
@@ -153,7 +165,7 @@ O backfill so funciona dentro da retencao do raw (`RawDataRetentionDays`). Runbo
 ## Dados gerados
 
 ```text
-raw/source=openweather-free-plan/product=<produto>/year=/month=/day=/hour=/state=<uf>/city=<cidade>/openweather_<produto>_<uf>_<cidade>_<timestamp>.json
+raw/source=openweather-free-plan/product=<produto>/year=/month=/day=/hour=/openweather_<produto>_<yyyymmddThhmmZ>_<hash-das-UFs>.json
 curated/hourly_observations/year=/month=/day=/hour=/weather_hourly_observations_<yyyymmddThh00Z>.parquet
 curated/daily_observations/year=/month=/day=/weather_daily_observations_<yyyymmdd>.parquet
 curated/forecast_3h/year=/month=/day=/hour=/weather_forecast_3h_<yyyymmddThh00Z>.parquet
@@ -183,7 +195,11 @@ Detalhes em [`docs/frontend.md`](docs/frontend.md).
 
 ## Custos
 
-Com a cadencia padrao o custo estimado fica em torno de US$ 4 a 5 por mes, dominado pelos PUTs no S3 raw. Detalhes e alavancas em [`docs/cost-controls.md`](docs/cost-controls.md).
+- **AWS**: ~US$ 0,70/mes com a cadencia padrao, quase tudo requisicoes ao S3; Lambda, SQS, CloudWatch, CloudFront, SNS, SSM e Glue ficam dentro das cotas sempre gratuitas. No plano Free (6 meses, ate US$ 200 em creditos) isso sai dos creditos, ~US$ 4 no periodo todo.
+- **Atencao**: no fim do plano Free a AWS fecha a conta (90 dias para migrar e recuperar os dados). Rode `./scripts/export-from-aws.ps1` antes e continue no modo offline, ou migre para o plano Paid.
+- **Offline**: zero de nuvem.
+
+Detalhes e alavancas em [`docs/cost-controls.md`](docs/cost-controls.md).
 
 ## Destruir recursos
 
@@ -197,14 +213,15 @@ aws ssm delete-parameter --name /weather-data-pipeline/dev/openweather-api-key -
 ## Estrutura
 
 ```text
-src/planner      agenda jobs e aplica o teto mensal
-src/collector    chama a OpenWeather e grava o raw
+src/planner      agenda uma coleta por produto e aplica o teto mensal
+src/collector    consulta as 27 capitais e grava um objeto raw por coleta
 src/curator      tabelas Parquet, agregados diarios, catch-up e series do dashboard
 src/publisher    data/latest.json
 src/shared       capitais, API, observacoes, tabelas, serving, metricas
 layers/analytics pyarrow (somente na Curator)
 frontend/        dashboard estatico
-scripts/         deploy, operacao e execucao local
+scripts/         deploy, operacao, modo offline (offline_service.py), consultas DuckDB, exportacao da AWS
+Dockerfile       modo offline em container (docker compose up -d)
 queries/         consultas Athena
 docs/            arquitetura, decisoes, custos, runbook
 ```

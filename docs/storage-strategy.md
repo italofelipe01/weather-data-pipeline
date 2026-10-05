@@ -19,7 +19,7 @@ O objetivo e evitar que o S3 vire um deposito permanente de milhoes de JSONs peq
 ## Chaves
 
 ```text
-raw/source=openweather-free-plan/product=<produto>/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/state=<uf>/city=<cidade>/openweather_<produto>_<uf>_<cidade>_<yyyymmddThhmmZ>.json
+raw/source=openweather-free-plan/product=<produto>/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/openweather_<produto>_<yyyymmddThhmmZ>_<hash-das-UFs>.json
 curated/hourly_observations/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_hourly_observations_<yyyymmddThh00Z>.parquet
 curated/daily_observations/year=<yyyy>/month=<mm>/day=<dd>/weather_daily_observations_<yyyymmdd>.parquet
 curated/forecast_3h/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/weather_forecast_3h_<yyyymmddThh00Z>.parquet
@@ -33,7 +33,7 @@ As particoes `year/month/day/hour` sao lidas pelo Athena via partition projectio
 
 ## Por que expirar o raw
 
-Com a cadencia padrao o pipeline grava cerca de 445 mil objetos por mes. O raw so e necessario para reprocessamento (`invoke-curator.ps1 -StartHour/-EndHour`), entao 30 dias bastam. A camada curada guarda ~720 arquivos horarios, ~720 de previsao e ~30 diarios por mes.
+Cada objeto raw guarda uma coleta inteira (`format: batch-v1`, lista `items` com `job` e `response` de cada capital e lista `failures`). Com a cadencia padrao sao cerca de 16,5 mil objetos por mes (~1 GB). Objetos da versao anterior, um por capital (`.../state=<uf>/city=<cidade>/openweather_<produto>_<uf>_<cidade>_<timestamp>.json`), continuam sendo lidos ate expirarem. O raw so e necessario para reprocessamento (`invoke-curator.ps1 -StartHour/-EndHour`), entao 30 dias bastam. A camada curada guarda ~720 arquivos horarios, ~720 de previsao e ~30 diarios por mes.
 
 ## Compatibilidade
 

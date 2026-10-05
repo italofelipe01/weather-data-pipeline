@@ -4,7 +4,12 @@ C:\repositories\weather-data-pipeline
 
 OBJETIVO
 
-Manter uma pipeline serverless AWS que coleta dados atuais, previsoes e qualidade do ar da OpenWeather para todas as capitais do Brasil, usando apenas os recursos do plano gratuito, formando uma base temporal propria para analises e um dashboard web que funciona sem intervencao manual.
+Manter uma pipeline que coleta dados atuais, previsoes e qualidade do ar da OpenWeather para todas as capitais do Brasil, usando apenas os recursos do plano gratuito, formando uma base temporal propria para analises e um dashboard web que funciona sem intervencao manual.
+
+O mesmo codigo roda em dois modos:
+
+- AWS serverless (custo ~US$ 0,70/mes, coberto pelos creditos do plano Free da AWS).
+- Offline, na maquina do usuario ou em Docker, sem nenhuma dependencia de nuvem alem da API da OpenWeather.
 
 O projeto nao compra historico passado. A analise historica e construida a partir dos snapshots coletados continuamente.
 
@@ -79,7 +84,7 @@ Recursos auxiliares:
 
 CONTROLE DE CUSTO
 
-O projeto deve ser saudavel para operar com US$ 100 de credito durante seis meses (estimativa atual: US$ 4 a 5 por mes).
+O projeto deve ser saudavel para operar com US$ 100 de credito durante seis meses (estimativa atual: ~US$ 0,70 por mes, quase tudo requisicoes S3; o resto fica nas cotas sempre gratuitas). O plano Free da AWS fecha a conta apos 6 meses: os dados devem poder ser exportados para o modo offline.
 
 Padroes obrigatorios:
 
@@ -92,33 +97,35 @@ Padroes obrigatorios:
 7. Budget opcional via parametro BudgetAlertEmail.
 8. Teto operacional OpenWeather de 500.000 chamadas/mes aplicado no codigo.
 9. Metricas e alarmes dentro do Free Tier do CloudWatch.
+10. Um objeto raw por coleta (27 capitais), nao por capital.
+11. Teto mensal com contador gratuito (SSM padrao), sem CloudWatch GetMetricData.
 
 LAMBDA PLANNER
 
 A Planner deve:
 
-1. Gerar um job por capital e produto.
+1. Gerar uma coleta (mensagem) por produto, com a lista de capitais.
 2. Aceitar filtro opcional por UF (UFs invalidas geram erro).
 3. Aceitar produtos current_weather, forecast_5d_3h, air_pollution, air_pollution_forecast ou "all".
 4. Definir snapshot_at em UTC arredondado para minuto.
 5. Enviar mensagens para SQS FIFO em lotes de 10.
-6. Usar MessageGroupId por UF.
-7. Usar MessageDeduplicationId derivado do conteudo do job.
-8. Consultar a metrica OpenWeatherApiCalls do mes e nao enfileirar jobs que ultrapassem o teto.
+6. Usar MessageGroupId por produto.
+7. Usar MessageDeduplicationId derivado do conteudo da coleta.
+8. Ler o contador mensal de chamadas (parametro SSM) e nao enfileirar coletas que ultrapassem o teto; somar as chamadas agendadas ao contador.
 
 LAMBDA COLLECTOR
 
 A Collector deve:
 
-1. Processar lotes da SQS.
-2. Implementar partial batch response.
+1. Processar uma coleta por mensagem da SQS, consultando as capitais em sequencia com 1,1 s entre chamadas.
+2. Implementar partial batch response e descartar coletas atrasadas demais (15 min para a Current Weather).
 3. Ler appid da OpenWeather no SSM SecureString (cache curto, descartado em HTTP 401).
 4. Nunca registrar appid.
 5. Chamar o endpoint correto conforme product.
 6. Validar resposta JSON por produto.
-7. Tratar 401, 408, 425, 429 e 5xx como retry; descartar 400/403/404 e payloads invalidos.
-8. Gravar raw JSON no S3.
-9. Usar chave S3 deterministica por produto, capital e snapshot_at.
+7. Repetir 401, 408, 425, 429 e 5xx ate 3 vezes dentro da coleta; descartar 400/403/404 e payloads invalidos.
+8. Gravar um unico raw JSON por coleta no S3 (formato batch-v1).
+9. Usar chave S3 deterministica por produto, snapshot_at e conjunto de UFs.
 10. Usar If-None-Match igual a "*".
 11. Publicar metricas EMF no stdout (OpenWeatherApiCalls, SourceJobsCollected, SourceJobFailures, SourceJobsRejected).
 
@@ -146,7 +153,9 @@ A Publisher deve:
 
 S3 RAW
 
-raw/source=openweather-free-plan/product=<produto>/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/state=<uf>/city=<cidade>/openweather_<produto>_<uf>_<cidade>_<timestamp>.json
+raw/source=openweather-free-plan/product=<produto>/year=<yyyy>/month=<mm>/day=<dd>/hour=<hh>/openweather_<produto>_<timestamp>_<hash-das-UFs>.json
+
+(objetos antigos, um por capital em .../state=<uf>/city=<cidade>/, continuam legiveis ate expirarem)
 
 S3 CURATED
 
@@ -164,6 +173,19 @@ Site estatico em frontend/, servido pelo CloudFront, com:
 - situacao do pipeline e consumo da API;
 - tema claro/escuro, tabela equivalente para cada grafico e layout responsivo.
 
+MODO OFFLINE
+
+scripts/offline_service.py deve:
+
+1. Rodar as mesmas funcoes da AWS (coleta em lote, Curator, Publisher) com agendador interno na mesma cadencia.
+2. Executar uma vez as tarefas perdidas quando a maquina volta a ser ligada.
+3. Aplicar o teto mensal com contador em arquivo.
+4. Gravar no mesmo layout de chaves do S3 em .local-data/lake/.
+5. Servir o dashboard em http://localhost:8000.
+6. Apagar o raw local apos a retencao (padrao 30 dias).
+
+Tambem devem existir: imagem Docker (docker compose up -d), tarefa agendada do Windows, consultas DuckDB com o mesmo SQL do Athena e exportacao dos dados da AWS para o layout local.
+
 COMANDOS
 
 Testes:
@@ -174,9 +196,19 @@ Pre-visualizar o dashboard sem AWS:
 
 ./scripts/preview-frontend.ps1
 
-Pipeline local com a API real:
+Modo offline (sem nuvem):
 
-./scripts/run-local-pipeline.ps1 -States SP,RJ -Serve
+./scripts/start-offline.ps1
+docker compose up -d
+./scripts/install-offline-service.ps1
+
+Trazer os dados da AWS para o modo offline:
+
+./scripts/export-from-aws.ps1 -StackName weather-data-pipeline-dev -Region sa-east-1
+
+Consultar localmente:
+
+python scripts/query_local.py queries/monthly_from_daily.sql
 
 Deploy completo (build, deploy, chave no SSM a partir do .env, frontend e primeira coleta):
 

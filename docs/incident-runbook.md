@@ -4,13 +4,13 @@ Todos os alarmes publicam no topico SNS `<stack>-alerts` (e-mail definido em `Bu
 
 ## `<stack>-source-rejected` ou `<stack>-collector-errors`
 
-Sintoma: a OpenWeather respondeu erro. Rejeitados (400/403/404, payload inesperado) sao descartados; falhas (401, 429, 5xx, timeout) voltam para a fila.
+Sintoma: a OpenWeather respondeu erro. Rejeitados (400/403/404, payload inesperado) sao descartados; falhas transitorias (401, 429, 5xx, timeout) sao repetidas ate 3 vezes dentro da coleta, e a coleta so volta para a fila se todas as capitais falharem. Cada linha `source_batch_processed` lista `failures` e `rejected` por UF.
 
 1. CloudWatch Logs Insights na Collector:
 
    ```text
-   fields @timestamp, message, state, product, status_code, error
-   | filter message in ["source_job_rejected", "source_job_failed"]
+   fields @timestamp, @message
+   | filter @message like /source_batch_failed|"failures":\[\{|"rejected":\[\{/
    | sort @timestamp desc
    | limit 50
    ```
@@ -30,7 +30,7 @@ Nenhum snapshot gravado em 30 minutos com agenda ligada. Verifique, nesta ordem:
 
 ## `<stack>-monthly-call-limit`
 
-A Planner suspendeu coletas porque o teto mensal foi atingido. Elas voltam sozinhas no dia 1. Para liberar antes, aumente `MonthlyOperationalCallLimit` (maximo 500.000) ou reduza a cadencia. Para uma coleta pontual: `./scripts/invoke-planner.ps1 -Products current_weather -SkipBudgetCheck`.
+A Planner suspendeu coletas porque o contador mensal (parametro SSM `/<stack>/openweather-call-counter`) atingiu o teto. Elas voltam sozinhas no dia 1. Para liberar antes, aumente `MonthlyOperationalCallLimit` (maximo 500.000) ou reduza a cadencia. Para uma coleta pontual: `./scripts/invoke-planner.ps1 -Products current_weather -SkipBudgetCheck`.
 
 ## `<stack>-source-dlq-visible`
 
@@ -60,4 +60,8 @@ O frontend mostra um aviso quando a observacao mais recente tem mais de 45 minut
 
 ## Localizar uma coleta
 
-Procure por `state`, `product` e `snapshot_at` nos logs da Collector (`source_job_processed` traz `s3_key`).
+Procure por `product` e `snapshot_at` nos logs da Collector (`source_batch_processed` traz `s3_key`, um objeto com as 27 capitais).
+
+## Modo offline
+
+O servico offline registra tudo em `.local-data/logs/offline-service.log` (ou `docker compose logs weather`). Coletas com problema aparecem como `WARNING collected ...` com a UF e o erro; o teto mensal aparece como `collection skipped: monthly limit reached`. O contador fica em `.local-data/state/call-counter.json`.

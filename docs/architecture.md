@@ -5,8 +5,8 @@ O pipeline coleta snapshots recorrentes de clima atual, previsao e qualidade do 
 ## Fluxo
 
 1. **EventBridge** dispara a Lambda **Planner** em quatro agendas (Current Weather a cada `CurrentWeatherIntervalMinutes`, Forecast no minuto 05, Air Pollution no minuto 35 e Air Pollution forecast a cada 6 horas no minuto 50).
-2. A **Planner** cria um job por capital e produto, consulta a metrica `OpenWeatherApiCalls` do mes e **suspende a coleta** se o teto `MonthlyOperationalCallLimit` seria ultrapassado. Os jobs vao para a **SQS FIFO** em lotes de 10, com `MessageGroupId` por UF e `MessageDeduplicationId` derivado do conteudo.
-3. A **Collector** consome a fila (lotes de 5, no maximo 2 execucoes simultaneas), le a chave no **SSM** (cache de 5 minutos, descartado em HTTP 401), chama a OpenWeather e grava o JSON bruto no S3 com chave deterministica e `If-None-Match: *`. Partial batch response: so os itens com falha voltam para a fila; apos 3 tentativas vao para a **DLQ**.
+2. A **Planner** cria **uma mensagem por produto** com a lista das 27 capitais, le o contador mensal de chamadas (parametro SSM padrao, gratuito) e **suspende a coleta** se o teto `MonthlyOperationalCallLimit` seria ultrapassado. As mensagens vao para a **SQS FIFO** com `MessageGroupId` por produto e `MessageDeduplicationId` derivado do conteudo; em seguida o contador e incrementado.
+3. A **Collector** recebe uma coleta por vez (no maximo 2 execucoes simultaneas), descarta coletas velhas demais para serem rotuladas corretamente (15 min para a Current Weather), le a chave no **SSM** (cache de 5 minutos, descartado em HTTP 401) e consulta as capitais **em sequencia, uma chamada a cada 1,1 s**, repetindo ate 3 vezes erros transitorios (429, 5xx, timeout). As respostas viram **um unico objeto JSON** no S3, com chave deterministica e `If-None-Match: *`. Se todas as capitais falharem, a mensagem volta para a fila; apos 3 tentativas vai para a **DLQ**.
 4. A **Curator** roda no minuto 20 de cada hora:
    - verifica as ultimas `CURATOR_LOOKBACK_HOURS` (6) horas e reconstroi as que nao tem arquivo curado (catch-up automatico);
    - gera a tabela horaria (Current Weather + Air Pollution) e a tabela de previsoes emitidas na hora;
@@ -22,7 +22,7 @@ O pipeline coleta snapshots recorrentes de clima atual, previsao e qualidade do 
 | Funcao | Gatilho | Memoria / timeout | Dependencias |
 |---|---|---|---|
 | Planner | EventBridge (4 agendas) | 256 MB / 60 s | boto3 do runtime |
-| Collector | SQS FIFO | 256 MB / 60 s | boto3 do runtime |
+| Collector | SQS FIFO (1 mensagem por invocacao) | 128 MB / 300 s | boto3 do runtime |
 | Curator | EventBridge (hora:20) | 1024 MB / 300 s | layer `AnalyticsLayer` (pyarrow) |
 | Publisher | EventBridge (10 min) | 256 MB / 120 s | boto3 do runtime |
 
@@ -41,6 +41,10 @@ Somente a Curator recebe a layer com pyarrow; as demais ficam com ~200 KB e cold
 | Publisher | `{}` | republica `data/latest.json` |
 
 Exemplos em `events/`.
+
+## Modo offline
+
+`scripts/offline_service.py` executa as mesmas funcoes (`collect_batch`, Curator `run`, `publish_latest`) com um agendador interno, um S3 em disco (`scripts/local_s3.py`) e um contador de chamadas em arquivo. O layout de chaves e identico ao do S3, entao os dados podem ir e voltar entre os modos com `aws s3 sync`. Veja [offline.md](offline.md).
 
 ## Seguranca
 

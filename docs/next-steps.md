@@ -4,7 +4,7 @@ Ja implementado: Air Pollution, tabela horaria completa, previsoes curadas, agre
 
 Possiveis evolucoes:
 
-1. **Reduzir PUTs no S3**: agrupar os snapshots de um mesmo minuto em um unico objeto por produto (27 capitais por PUT) cortaria ~95% do principal custo do projeto.
+1. **Reduzir as escritas do dashboard**: a Curator regrava 54 JSON por hora (series horarias e previsoes por capital); juntar os dois documentos por capital cortaria metade dos PUTs restantes (~US$ 0,14/mes).
 2. **Precisao das previsoes no dashboard**: a consulta `queries/forecast_accuracy.sql` ja calcula vies e erro medio por antecedencia; publicar esse resultado em `data/` permitiria mostrar a confiabilidade da previsao por capital.
 3. **Mapa**: camadas de mapa da OpenWeather (Basic weather maps, plano Free) exigem a chave no navegador; so fazem sentido com um proxy com cache.
 4. **Alertas meteorologicos proprios**: regras simples (rajada acima de X, chuva acima de Y mm/h, AQI >= 4) publicadas no SNS.

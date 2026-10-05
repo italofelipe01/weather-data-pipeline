@@ -33,7 +33,7 @@ Todos os documentos tem `schema_version` e `generated_at`. Os nomes de campos se
 
 ```powershell
 ./scripts/preview-frontend.ps1                    # dados sinteticos
-./scripts/run-local-pipeline.ps1 -States SP -Serve  # API real
+./scripts/start-offline.ps1                       # API real, modo offline completo
 ```
 
 Os icones de condicao sao SVG desenhados localmente (`frontend/assets/icons.js`): o site nao faz nenhuma requisicao externa e funciona offline.

@@ -30,5 +30,6 @@ Nao usamos One Call, History API, Air Pollution history nem qualquer produto pag
 
 - Teto adotado: 500.000 chamadas/mes (50% do Free), aplicado pela Planner.
 - Cadencia padrao: 445.284 chamadas em 31 dias (detalhe no README).
-- Cada agenda gera 27 chamadas; no maximo duas agendas compartilham uma janela de 60 s, e a Collector roda com concorrencia maxima 2.
-- HTTP 429, 5xx, 408, 425 e timeouts sao reprocessados pela fila. HTTP 401 descarta a chave em cache e tambem e reprocessado (uma chave nova pode levar algumas horas para ser ativada pela OpenWeather). 400/403/404 e respostas fora do formato sao descartados e contados em `SourceJobsRejected`.
+- Cada coleta consulta as 27 capitais em sequencia, uma chamada a cada 1,1 s (~30 s por coleta); no maximo duas coletas rodam ao mesmo tempo e os horarios das agendas evitam que duas caiam na mesma janela de 60 s com folga menor que 54 chamadas.
+- No modo offline, todas as chamadas passam por um unico ritmo de 1,1 s, entao nenhuma janela de 60 s passa de 55 chamadas.
+- HTTP 429, 5xx, 408, 425 e timeouts sao repetidos dentro da propria coleta (ate 3 tentativas, espera de 2 s e 5 s); se todas as capitais falharem, a coleta volta para a fila. HTTP 401 descarta a chave em cache e tambem e reprocessado (uma chave nova pode levar algumas horas para ser ativada pela OpenWeather). 400/403/404 e respostas fora do formato sao descartados e contados em `SourceJobsRejected`.
